@@ -1346,8 +1346,11 @@ pub fn ssmSnapshotBackoff(want_ssm_cp: bool, prefix_len: usize, restored: bool) 
 /// and resends the history resumes at the first dropped message's start, so the prefill
 /// snapshots EXACTLY there instead of up to a stride below. Only the newest this many
 /// boundaries of the forwarded span cut chunks: each cut is one more chunk, and on MoE every
-/// chunk re-streams the experts, so a cold 200-message prompt must not pay 200 sweeps.
-pub const SSM_BOUNDARY_MAX: usize = 8;
+/// chunk re-streams the experts, so a cold 200-message prompt must not pay 200 sweeps. An agent
+/// turn's tail holds one or two (the tool result, the generation prompt), and a fold point is
+/// always the start of some turn's tail. Consecutive tool results render as ONE ChatML user
+/// message on Qwen templates, so they share a boundary.
+pub const SSM_BOUNDARY_MAX: usize = 4;
 
 /// Positions `p` with `tokens[p] == turn_start`: the state after `p` tokens is the state
 /// just before that message's header. Ascending; caller frees.

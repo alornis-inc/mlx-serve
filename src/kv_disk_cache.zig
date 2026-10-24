@@ -2980,23 +2980,29 @@ pub const DiskTier = struct {
         root_dir.deleteTree(self.io, rel) catch {};
     }
 
+    fn indexEntryTokens(e: *const IndexEntry) []const u32 {
+        return e.tokens;
+    }
+
+    /// The LRU record, pin keepers (`PinSet.keeps`) skipped when `skip_keepers`: a branch
+    /// point's record goes last, but the byte budget still holds.
+    fn lruIndexPinAware(self: *const DiskTier, skip_keepers: bool) ?usize {
+        var lru_idx: ?usize = null;
+        var lru_used: u64 = std.math.maxInt(u64);
+        for (self.entries.items, 0..) |*e, i| {
+            if (skip_keepers) if (self.pins) |ps| if (ps.pins.items.len > 0 and ps.keeps(self.entries.items, i, indexEntryTokens)) continue;
+            if (e.last_used < lru_used) {
+                lru_used = e.last_used;
+                lru_idx = i;
+            }
+        }
+        return lru_idx;
+    }
+
     fn gcToBudget(self: *DiskTier) void {
         if (self.max_bytes == 0) return;
         while (self.total_bytes > self.max_bytes and self.entries.items.len > 1) {
-            var lru_idx: ?usize = null;
-            var lru_used: u64 = std.math.maxInt(u64);
-            for (self.entries.items, 0..) |*e, i| {
-                // A context-folding branch point: pins outrank the byte budget.
-                if (self.pins) |ps| if (ps.holds(e.tokens)) continue;
-                if (e.last_used < lru_used) {
-                    lru_used = e.last_used;
-                    lru_idx = i;
-                }
-            }
-            const victim = lru_idx orelse {
-                log.warn("  [disk-cache] over budget, but every remaining entry holds a pinned branch point\n", .{});
-                break;
-            };
+            const victim = self.lruIndexPinAware(true) orelse self.lruIndexPinAware(false).?;
             const mb = @as(f64, @floatFromInt(self.entries.items[victim].bytes)) / (1024.0 * 1024.0);
             log.info("  [disk-cache] evicted LRU entry (byte budget; {d:.1} MB)\n", .{mb});
             self.removeAt(victim);

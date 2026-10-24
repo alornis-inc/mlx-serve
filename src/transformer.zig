@@ -14309,8 +14309,9 @@ pub fn spanPreservingDropIndex(
 
 /// `spanPreservingDropIndex` that never selects a PINNED index (`pinned[i]`, a context-folding
 /// branch point, `cache_pins.zig`): a pin outranks the cap and the anchors. When the plain pick
-/// is pinned, the unpinned index whose removal widens the coverage gap least goes instead (the
-/// newest only if nothing else is left). Null = every index is pinned: the list stays over cap.
+/// is pinned, the unpinned index whose removal widens the coverage gap least goes instead. The
+/// newest is never a candidate (on qwen4_exp it carries the only QSA indexer history). Null =
+/// nothing but pins and the newest are left: the list stays over cap.
 pub fn spanPreservingDropIndexPinned(
     comptime T: type,
     items: []const T,
@@ -14341,9 +14342,9 @@ pub fn spanPreservingDropIndexPinned(
         }
         if (best) |b| return b;
     }
-    // Then the oldest unpinned below the newest, then the newest itself.
+    // Then the oldest unpinned below the newest.
     for (0..last) |k| if (!pinned[k]) return k;
-    return if (pinned[last]) null else last;
+    return null;
 }
 
 /// `spanPreservingDropIndexPinned` over a checkpoint list.
@@ -75734,9 +75735,9 @@ test "spanPreservingDropIndexPinned: a pinned branch point outranks the thinning
     // 110 pinned: the next least-widening unpinned index goes instead (100).
     const p2 = [_]bool{ false, false, true, false, false };
     try t.expectEqual(@as(?usize, 1), positionDropIndexPinned(&pos, .min_span, 0, &p2));
-    // Everything but the newest pinned: the newest is the last resort.
+    // Everything but the newest pinned: the newest is never dropped, the list stays over cap.
     const all_but_last = [_]bool{ true, true, true, true, false };
-    try t.expectEqual(@as(?usize, 4), positionDropIndexPinned(&pos, .min_span, 0, &all_but_last));
+    try t.expectEqual(@as(?usize, null), positionDropIndexPinned(&pos, .min_span, 0, &all_but_last));
     const all = [_]bool{ true, true, true, true, true };
     try t.expectEqual(@as(?usize, null), positionDropIndexPinned(&pos, .min_span, 0, &all));
     // `.oldest` drops index 0; pinned, the next oldest goes.

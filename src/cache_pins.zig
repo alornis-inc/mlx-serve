@@ -100,11 +100,30 @@ pub const PinSet = struct {
         return false;
     }
 
-    /// Does a record of `tokens` hold any pinned prefix? Such a record is exempt from eviction:
-    /// a restore at the pin needs its KV below the pinned position too.
-    pub fn holds(self: *const PinSet, tokens: []const u32) bool {
+    /// Does a record of `tokens` cover `pin` (a restore at the pin can come from it)?
+    pub fn covers(pin: Pin, tokens: []const u32) bool {
+        return pin.pos <= tokens.len and pin.digest == prefixDigest(tokens[0..pin.pos]);
+    }
+
+    /// Is the record `records[idx]` some pin's KEEPER: the shortest record covering it (the
+    /// lowest index on a tie)? Only keepers are preferred over other eviction victims; a longer
+    /// record of the same session (the investigation itself) is ordinary prey. `tokensOf` maps a
+    /// record to its tokens.
+    pub fn keeps(self: *const PinSet, records: anytype, idx: usize, comptime tokensOf: anytype) bool {
+        const mine = tokensOf(&records[idx]);
         for (self.pins.items) |p| {
-            if (p.pos <= tokens.len and p.digest == prefixDigest(tokens[0..p.pos])) return true;
+            if (!covers(p, mine)) continue;
+            var shortest = true;
+            for (records, 0..) |*r, j| {
+                if (j == idx) continue;
+                const other = tokensOf(r);
+                if (other.len > mine.len or (other.len == mine.len and j > idx)) continue;
+                if (covers(p, other)) {
+                    shortest = false;
+                    break;
+                }
+            }
+            if (shortest) return true;
         }
         return false;
     }
@@ -115,6 +134,10 @@ pub const PinSet = struct {
         for (positions, out) |p, *o| o.* = self.pinnedAt(tokens, @intCast(p));
     }
 };
+
+fn sliceOf(r: *const []const u32) []const u32 {
+    return r.*;
+}
 
 test "PinSet: content-addressed, per-key cap, session drop" {
     const t = std.testing;
@@ -128,15 +151,20 @@ test "PinSet: content-addressed, per-key cap, session drop" {
     // Same position, different prefix: not pinned.
     const other = [_]u32{ 1, 2, 9, 4, 5, 6 };
     try t.expect(!set.pinnedAt(&other, 4));
-    try t.expect(set.holds(&toks));
-    try t.expect(!set.holds(&other));
-    try t.expect(!set.holds(toks[0..3]));
+    try t.expect(PinSet.covers(set.pins.items[0], &toks));
+    try t.expect(!PinSet.covers(set.pins.items[0], &other));
+    try t.expect(!PinSet.covers(set.pins.items[0], toks[0..3]));
+    // Keeper = the shortest record covering the pin; a longer one of the session is not.
+    const records = [_][]const u32{ &toks, toks[0..5], &other };
+    try t.expect(!set.keeps(&records, 0, sliceOf));
+    try t.expect(set.keeps(&records, 1, sliceOf));
+    try t.expect(!set.keeps(&records, 2, sliceOf));
     var m: [3]bool = undefined;
     set.mask(&toks, &[_]u32{ 2, 4, 6 }, &m);
     try t.expectEqualSlices(bool, &.{ false, true, false }, &m);
     try t.expect(set.remove(a));
     try t.expect(!set.remove(a));
-    try t.expect(!set.holds(&toks));
+    try t.expect(!set.keeps(&records, 1, sliceOf));
 
     var long: [MAX_PINS_PER_KEY + 2]u32 = undefined;
     for (&long, 0..) |*x, i| x.* = @intCast(i);

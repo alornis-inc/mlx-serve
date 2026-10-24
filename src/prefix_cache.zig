@@ -586,9 +586,16 @@ pub const HotPrefixCache = struct {
         return if (any) buf[0..cps.len] else null;
     }
 
-    fn holdsPin(self: *const HotPrefixCache, tokens: []const u32) bool {
+    fn entryTokens(e: *const Entry) []const u32 {
+        return e.tokens;
+    }
+
+    /// Is `entries[idx]` some pin's keeper (`PinSet.keeps`)? Eviction PREFERS other victims;
+    /// it never refuses one, so a full set of pinned entries cannot push past the budget.
+    fn keepsPin(self: *const HotPrefixCache, idx: usize) bool {
         const ps = self.pins orelse return false;
-        return ps.holds(tokens);
+        if (ps.pins.items.len == 0) return false;
+        return ps.keeps(self.entries.items, idx, entryTokens);
     }
 
     /// The thinning pick for `cps` (a list of a record of `tokens`), honouring pins. Null =
@@ -2473,6 +2480,12 @@ pub const HotPrefixCache = struct {
     /// entry stays exempt from the non-durable shed — that single RAM copy is
     /// the only home of its media-suffix state until the tier holds one.
     fn oldestIdleIndex(self: *HotPrefixCache, newest_used: u64, durable_only: bool) ?usize {
+        // A pin keeper with no durable copy goes last: this RAM entry is its only home.
+        if (!durable_only) if (self.oldestIdleIndexPinAware(newest_used, false, true)) |i| return i;
+        return self.oldestIdleIndexPinAware(newest_used, durable_only, false);
+    }
+
+    fn oldestIdleIndexPinAware(self: *HotPrefixCache, newest_used: u64, durable_only: bool, skip_keepers: bool) ?usize {
         var best: ?usize = null;
         var best_used: u64 = std.math.maxInt(u64);
         for (self.entries.items, 0..) |*e, i| {
@@ -2480,8 +2493,7 @@ pub const HotPrefixCache = struct {
             if (e.checked_out_by != null) continue;
             if (durable_only and !e.spill_durable) continue;
             if (!durable_only and e.media.len != 0 and !e.spill_durable) continue;
-            // A pinned branch point with no durable copy stays: this RAM entry is its only home.
-            if (!durable_only and self.holdsPin(e.tokens)) continue;
+            if (skip_keepers and self.keepsPin(i)) continue;
             if (e.last_used < best_used) {
                 best_used = e.last_used;
                 best = i;
@@ -3167,6 +3179,13 @@ pub const HotPrefixCache = struct {
     /// (`incoming_key` counts as one more) are candidates, so a sweep evicts its own
     /// documents before another workload's conversation. One key = plain LRU.
     fn lruIndexExcluding(self: *const HotPrefixCache, protect: ?u64, incoming_key: ?u64) ?usize {
+        // Pin keepers go last, never not at all: the byte budget is a hard cap (Metal does not
+        // survive an OOM), and SSD-first spills a keeper whole before this ever runs on it.
+        return self.lruIndexPinAware(protect, incoming_key, true) orelse
+            self.lruIndexPinAware(protect, incoming_key, false);
+    }
+
+    fn lruIndexPinAware(self: *const HotPrefixCache, protect: ?u64, incoming_key: ?u64, skip_keepers: bool) ?usize {
         var best: ?usize = null;
         var best_used: u64 = std.math.maxInt(u64);
         var max_count: usize = 0;
@@ -3176,8 +3195,7 @@ pub const HotPrefixCache = struct {
             if (protect) |p| {
                 if (e.last_used == p) continue;
             }
-            // A folding branch point lives here; SSD-first spills it instead (`oldestIdleIndex`).
-            if (self.holdsPin(e.tokens)) continue;
+            if (skip_keepers and self.keepsPin(i)) continue;
             var count: usize = if (incoming_key != null and incoming_key.? == e.cache_key) 1 else 0;
             for (self.entries.items) |*o| {
                 if (o.checked_out_by != null or o.cache_key != e.cache_key) continue;
@@ -4680,11 +4698,12 @@ test "HotPrefixCache: a pinned branch point survives thinning and eviction" {
     // The folded resend restores exactly at the pin.
     try testing.expect(hc.checkpointExactlyAt(tokens[0..4]));
 
-    // Pinned: never the LRU victim, whatever its age.
-    try testing.expectEqual(@as(?usize, null), hc.lruIndexExcluding(null, null));
+    // A pin keeper is the LAST victim, never refused: alone, it still goes (hard budget).
+    try testing.expectEqual(@as(?usize, 0), hc.lruIndexExcluding(null, null));
+    try testing.expect(hc.keepsPin(0));
     try testing.expect(hc.unpin(id));
     try testing.expect(!hc.unpin(id));
-    try testing.expectEqual(@as(?usize, 0), hc.lruIndexExcluding(null, null));
+    try testing.expect(!hc.keepsPin(0));
     try testing.expectEqual(@as(usize, 0), hc.unpinSession(key));
 }
 
