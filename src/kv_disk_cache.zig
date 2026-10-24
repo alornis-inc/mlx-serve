@@ -2361,7 +2361,7 @@ pub const DiskTier = struct {
         if (self.pins) |ps| if (ps.pins.items.len > 0) {
             try pinned.resize(self.allocator, set.items.len);
             ps.mask(tokens, set.items, pinned.items);
-        }
+        };
         while (set.items.len > self.ssm_max_per_entry) {
             if (pinned.items.len == 0) {
                 _ = set.orderedRemove(transformer_mod.positionDropIndexLowAnchored(set.items, self.cp_thin, anchors));
@@ -3014,7 +3014,7 @@ pub const DiskTier = struct {
                 if (keepers.resize(self.allocator, self.entries.items.len)) |_| {
                     ps.keeperMask(self.entries.items, indexEntryTokens, indexEntryHasCheckpointAt, keepers.items);
                 } else |_| keepers.clearRetainingCapacity();
-            }
+            };
             const k: ?[]const bool = if (keepers.items.len > 0) keepers.items else null;
             const victim = self.lruIndexPinAware(k) orelse self.lruIndexPinAware(null).?;
             const mb = @as(f64, @floatFromInt(self.entries.items[victim].bytes)) / (1024.0 * 1024.0);
