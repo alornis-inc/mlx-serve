@@ -59,6 +59,9 @@ expect() { # name want-status "<status>\t<body>"
     if [ "$got" == "$2" ]; then ok "$1 -> $2"; else fail "$1 -> $got (want $2): ${3#*$'\t'}"; fi
 }
 body() { printf "%s" "${1#*$'\t'}"; }
+# JSON bodies come from jq: a literal {a,b} word inside a nested $(...) gets brace-expanded.
+sb()  { jq -nc --arg s "$1" --arg l "${2:-}" '{session_id:$s} + (if $l == "" then {} else {label:$l} end)'; }
+sbb() { jq -nc --arg s "$1" --arg b "$2" '{session_id:$s,branch_id:$b}'; }
 
 SYSTEM="You are a careful coding worker. Answer in at most three sentences."
 TASK="Task: explain what a ring buffer is and when it beats a linked list."
@@ -83,19 +86,19 @@ S=worker-1
 
 echo "[1] refusals before any turn"
 expect "POST /branch without session_id" 400 "$(req POST /branch '{}')"
-expect "POST /branch with no history" 409 "$(req POST /branch "{\"session_id\":\"$S\"}")"
+expect "POST /branch with no history" 409 "$(req POST /branch "$(sb "$S")")"
 r="$(req GET "/branches?session_id=$S")"; expect "GET /branches" 200 "$r"
 [ "$(body "$r" | jq '.data | length')" == 0 ] && ok "no open branches" || fail "list not empty: $(body "$r")"
 
 echo "[2] branch, nested branch, list"
 R1="$(chat $S "$(msgs system "$SYSTEM" user "$TASK")")" || { echo "fail: R1"; exit 1; }
 A1="$(jq -r '.choices[0].message.content' <<< "$R1")"
-r="$(req POST /branch "{\"session_id\":\"$S\",\"label\":\"read logs\"}")"; expect "POST /branch outer" 200 "$r"
+r="$(req POST /branch "$(sb "$S" "read logs")")"; expect "POST /branch outer" 200 "$r"
 B1="$(body "$r" | jq -r .id)"; P1="$(body "$r" | jq -r .position)"
 R2="$(chat $S "$(msgs system "$SYSTEM" user "$TASK" assistant "$A1" user "$JUNK")")" || { echo "fail: R2"; exit 1; }
 A2="$(jq -r '.choices[0].message.content' <<< "$R2")"
 chat $S "$(msgs system "$SYSTEM" user "$TASK" assistant "$A1" user "$JUNK" assistant "$A2" user "$JUNK2")" > /dev/null
-r="$(req POST /branch "{\"session_id\":\"$S\",\"label\":\"grep\"}")"; expect "POST /branch nested" 200 "$r"
+r="$(req POST /branch "$(sb "$S" "grep")")"; expect "POST /branch nested" 200 "$r"
 B2="$(body "$r" | jq -r .id)"; P2="$(body "$r" | jq -r .position)"
 [ "$P2" -gt "$P1" ] && ok "nested position $P2 > $P1" || fail "nested position $P2 <= $P1"
 r="$(req GET "/branches?session_id=$S")"
@@ -103,14 +106,14 @@ r="$(req GET "/branches?session_id=$S")"
     || fail "list: $(body "$r")"
 
 echo "[3] ownership"
-expect "return from another session" 404 "$(req POST /return "{\"session_id\":\"other\",\"branch_id\":\"$B1\"}")"
-expect "delete from another session" 404 "$(req DELETE /branch "{\"session_id\":\"other\",\"branch_id\":\"$B1\"}")"
+expect "return from another session" 404 "$(req POST /return "$(sbb "other" "$B1")")"
+expect "delete from another session" 404 "$(req DELETE /branch "$(sbb "other" "$B1")")"
 
 echo "[4] churn, then jump back to the outer branch"
 for k in churn-a churn-b churn-c; do chat $k "$(msgs system "Session $k." user "Count to five.")" > /dev/null; done
-r="$(req POST /return "{\"session_id\":\"$S\",\"branch_id\":\"$B1\"}")"; expect "POST /return outer" 200 "$r"
+r="$(req POST /return "$(sbb "$S" "$B1")")"; expect "POST /return outer" 200 "$r"
 [ "$(body "$r" | jq -r .position)" == "$P1" ] && ok "return position = branch position" || fail "return: $(body "$r")"
-expect "inner branch closed with it" 404 "$(req POST /return "{\"session_id\":\"$S\",\"branch_id\":\"$B2\"}")"
+expect "inner branch closed with it" 404 "$(req POST /return "$(sbb "$S" "$B2")")"
 
 echo "[5] the folded turn restores from the pinned branch point"
 R3="$(chat $S "$(msgs system "$SYSTEM" user "$TASK" assistant "$A1" user "$SUM1")")" || { echo "fail: R3"; exit 1; }
@@ -120,11 +123,11 @@ P1_PROMPT="$(jq -r '.usage.prompt_tokens' <<< "$R1")"
     || fail "folded turn cached_n=$C3 < R1 prompt $P1_PROMPT (pin lost to eviction?)"
 
 echo "[6] DELETE without folding"
-r="$(req POST /branch "{\"session_id\":\"$S\"}")"; expect "POST /branch" 200 "$r"
+r="$(req POST /branch "$(sb "$S")")"; expect "POST /branch" 200 "$r"
 B3="$(body "$r" | jq -r .id)"
-r="$(req DELETE /branch "{\"session_id\":\"$S\",\"branch_id\":\"$B3\"}")"; expect "DELETE /branch" 200 "$r"
+r="$(req DELETE /branch "$(sbb "$S" "$B3")")"; expect "DELETE /branch" 200 "$r"
 [ "$(body "$r" | jq -r .deleted)" == true ] && ok "deleted" || fail "delete: $(body "$r")"
-expect "DELETE again" 404 "$(req DELETE /branch "{\"session_id\":\"$S\",\"branch_id\":\"$B3\"}")"
+expect "DELETE again" 404 "$(req DELETE /branch "$(sbb "$S" "$B3")")"
 r="$(req GET "/branches?session_id=$S")"
 [ "$(body "$r" | jq '.data | length')" == 0 ] && ok "no open branches" || fail "list: $(body "$r")"
 
