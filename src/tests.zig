@@ -90,6 +90,7 @@ test {
     _ = @import("ws.zig");
     _ = @import("pld_index.zig");
     _ = @import("cache_pins.zig");
+    _ = @import("branches.zig");
     _ = @import("kv_quant.zig");
     _ = @import("model_settings.zig");
     _ = @import("load_progress.zig");
