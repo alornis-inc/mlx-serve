@@ -30,6 +30,7 @@ const mrope_mod = @import("mrope.zig");
 const vision_mod = @import("vision.zig");
 const log = @import("log.zig");
 const responses_mod = @import("responses.zig");
+const branches_mod = @import("branches.zig");
 const pld_index = @import("pld_index.zig");
 const prefix_cache_mod = @import("prefix_cache.zig");
 const tokenize_cache_mod = @import("tokenize_cache.zig");
@@ -834,12 +835,15 @@ const ROUTE_PATHS = [_][]const u8{
     "/api/show",
     "/api/tags",
     "/api/version",
+    "/branch",
+    "/branches",
     "/detokenize",
     "/health",
     "/launch",
     "/metrics",
     "/metrics.json",
     "/props",
+    "/return",
     "/tokenize",
     "/v1/3d/generations",
     "/v1/audio/music-generations",
@@ -2915,6 +2919,10 @@ fn handleConnection(
         return;
     }
 
+    if (std.mem.eql(u8, path, "/branch") or std.mem.eql(u8, path, "/branches") or std.mem.eql(u8, path, "/return")) {
+        try handleBranchRoute(allocator, stream, method, path, raw_path, request_body, lm);
+        return;
+    }
     if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/props")) {
         log.debug("GET  /props -> 200\n", .{});
         try handleProps(allocator, stream, lm);
@@ -19109,6 +19117,119 @@ fn handleResponsesDelete(allocator: std.mem.Allocator, stream: *Conn, id: []cons
     }
 }
 
+// ── Context-folding branches (branches.zig) ──
+
+var g_branches_init: std.Io.Mutex = .init;
+var g_branches: ?branches_mod.Registry = null;
+
+fn getOrInitBranches(io: std.Io, gpa: std.mem.Allocator) *branches_mod.Registry {
+    g_branches_init.lockUncancelable(io);
+    defer g_branches_init.unlock(io);
+    if (g_branches == null) g_branches = branches_mod.Registry.init(io, gpa);
+    return &g_branches.?;
+}
+
+/// The snapshot side of the branch routes: `HotPrefixCache` pins, run on the inference
+/// thread. Null until the snapshot store serves pins, so the pinning routes answer 501.
+fn branchStoreFor(lm: *LoadedModel) ?branches_mod.Store {
+    _ = lm;
+    return null;
+}
+
+const BranchArgs = struct { session_id: []const u8, branch_id: ?u64, label: []const u8 };
+
+/// Fields from the JSON body, else the query string (`GET`/`DELETE` clients send no body).
+/// `branch_id` is `"br_<n>"`; a malformed one reads as an unknown branch.
+fn parseBranchArgs(root: ?std.json.ObjectMap, raw_path: []const u8) ?BranchArgs {
+    const field = struct {
+        fn get(r: ?std.json.ObjectMap, raw: []const u8, name: []const u8) ?[]const u8 {
+            if (r) |o| if (o.get(name)) |v| return if (v == .string) v.string else null;
+            return queryParamValue(raw, name);
+        }
+    };
+    const sid = field.get(root, raw_path, "session_id") orelse return null;
+    if (sid.len == 0) return null;
+    const bid = field.get(root, raw_path, "branch_id");
+    return .{
+        .session_id = sid,
+        .branch_id = if (bid) |s| branches_mod.parseBranchId(s) orelse 0 else null,
+        .label = field.get(root, raw_path, "label") orelse "",
+    };
+}
+
+fn sendBranchError(allocator: std.mem.Allocator, stream: *Conn, err: anyerror) !void {
+    const status: []const u8, const kind: []const u8, const msg: []const u8, const code: u32 = switch (err) {
+        error.UnknownBranch => .{ "404 Not Found", "not_found", "No open branch with this branch_id in this session", 404 },
+        error.NoHistory => .{ "409 Conflict", "invalid_request_error", "This session has no completed turn to branch from (send a chat request with prompt_cache_key = session_id first)", 409 },
+        error.NoCheckpointAt => .{ "409 Conflict", "invalid_request_error", "No restorable snapshot at this position; branch at a message boundary or right after a turn", 409 },
+        error.TooManyBranches => .{ "429 Too Many Requests", "rate_limit_error", "Too many open branches in this session", 429 },
+        error.TooManySessions => .{ "429 Too Many Requests", "rate_limit_error", "Too many sessions with open branches", 429 },
+        else => return err,
+    };
+    try sendErrorResponse(allocator, stream, status, kind, msg, code);
+}
+
+/// `POST /branch`, `POST /return`, `GET /branches`, `DELETE /branch`. A session is the
+/// `prompt_cache_key` its chat requests carry; the chat surfaces are unchanged.
+fn handleBranchRoute(allocator: std.mem.Allocator, stream: *Conn, method: []const u8, path: []const u8, raw_path: []const u8, body: []const u8, lm: *LoadedModel) !void {
+    const is_list = std.mem.eql(u8, path, "/branches");
+    const is_return = std.mem.eql(u8, path, "/return");
+    const want: []const u8 = if (is_list) "GET" else if (is_return) "POST" else if (std.mem.eql(u8, method, "DELETE")) "DELETE" else "POST";
+    if (!std.mem.eql(u8, method, want))
+        return sendErrorResponse(allocator, stream, "405 Method Not Allowed", "invalid_request_error", "Method not allowed on this branch route", 405);
+
+    var parsed: ?std.json.Parsed(std.json.Value) = null;
+    defer if (parsed) |*p| p.deinit();
+    if (std.mem.trim(u8, body, " \t\r\n").len > 0) {
+        parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch
+            return sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Invalid JSON", 400);
+        if (parsed.?.value != .object)
+            return sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Request body must be a JSON object", 400);
+    }
+    const args = parseBranchArgs(if (parsed) |p| p.value.object else null, raw_path) orelse
+        return sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "'session_id' is required (the prompt_cache_key of the session's chat requests)", 400);
+    const key = branches_mod.sessionKey(args.session_id);
+    const reg = getOrInitBranches(stream.io, allocator);
+    const sid_json = try jsonEscape(allocator, args.session_id);
+    defer allocator.free(sid_json);
+
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    if (is_list) {
+        try reg.writeList(key, sid_json, &out.writer);
+        return sendResponse(stream, "200 OK", "application/json", out.written());
+    }
+    const st = branchStoreFor(lm) orelse
+        return sendErrorResponse(allocator, stream, "501 Not Implemented", "not_implemented", "Branch snapshots are not available for this model yet", 501);
+
+    if (!is_return and std.mem.eql(u8, method, "POST")) {
+        const head = st.sessionHead(st.ctx, key) orelse return sendBranchError(allocator, stream, error.NoHistory);
+        const pin = st.pin(st.ctx, key, head[0..reg.branchPos(key, head.len)]) catch |err| return sendBranchError(allocator, stream, err);
+        var old: ?branches_mod.PinId = null;
+        const b = reg.open(key, pin, args.label, io_util.nowMs(stream.io), &old) catch |err| {
+            st.unpin(st.ctx, pin);
+            return sendBranchError(allocator, stream, err);
+        };
+        if (old) |p| st.unpin(st.ctx, p);
+        try branches_mod.writeBranch(&out.writer, b, 0);
+    } else {
+        const id = args.branch_id orelse
+            return sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "'branch_id' is required", 400);
+        if (is_return) {
+            var released: std.ArrayList(branches_mod.PinId) = .empty;
+            defer released.deinit(allocator);
+            const b = reg.returnTo(key, id, &released) catch |err| return sendBranchError(allocator, stream, err);
+            defer reg.gpa.free(b.label);
+            for (released.items) |p| st.unpin(st.ctx, p);
+            try out.writer.print("{{\"id\":\"br_{d}\",\"object\":\"branch.return\",\"position\":{d},\"closed\":{d}}}", .{ b.id, b.pos, released.items.len });
+        } else {
+            st.unpin(st.ctx, reg.drop(key, id) catch |err| return sendBranchError(allocator, stream, err));
+            try out.writer.print("{{\"id\":\"br_{d}\",\"object\":\"branch\",\"deleted\":true}}", .{id});
+        }
+    }
+    try sendResponse(stream, "200 OK", "application/json", out.written());
+}
+
 fn responsesToolExists(
     tools_val: ?std.json.Value,
     name: []const u8,
@@ -28213,4 +28334,26 @@ test "proxiedBody: a Windows path id is spliced back escaped, so the forwarded b
     const out = try proxiedBody(a, body, raw, "C:\\m");
     defer a.free(out);
     try std.testing.expectEqualStrings("{\"model\":\"C:\\\\m\"}", out);
+}
+
+test "branch session key is the chat surfaces' prompt_cache_key workload key" {
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
+        \\{"prompt_cache_key":"worker-3","messages":[]}
+    , .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(requestCacheKey(parsed.value.object), branches_mod.sessionKey("worker-3"));
+}
+
+test "parseBranchArgs reads the body, else the query, and a bad branch_id is unknown" {
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
+        \\{"session_id":"s","branch_id":"br_4","label":"grep"}
+    , .{});
+    defer parsed.deinit();
+    const a = parseBranchArgs(parsed.value.object, "/branch").?;
+    try std.testing.expectEqualStrings("s", a.session_id);
+    try std.testing.expectEqual(@as(?u64, 4), a.branch_id);
+    const q = parseBranchArgs(null, "/branch?session_id=w&branch_id=nope").?;
+    try std.testing.expectEqualStrings("w", q.session_id);
+    try std.testing.expectEqual(@as(?u64, 0), q.branch_id);
+    try std.testing.expect(parseBranchArgs(null, "/branches") == null);
 }

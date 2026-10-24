@@ -78,6 +78,26 @@ const apiReference = [
   },
   {
     method: "POST",
+    path: "/branch",
+    description: N("Pin a session's history as a branch point (context folding)"),
+  },
+  {
+    method: "POST",
+    path: "/return",
+    description: N("Fold a session back to a branch"),
+  },
+  {
+    method: "GET",
+    path: "/branches",
+    description: N("List a session's open branches"),
+  },
+  {
+    method: "DELETE",
+    path: "/branch",
+    description: N("Drop a branch without folding back"),
+  },
+  {
+    method: "POST",
     path: "/v1/messages",
     description: N(
       "Claude SDK / Claude Code compatible \u00b7 stream & non-stream \u00b7 tool use \u00b7 thinking blocks",
