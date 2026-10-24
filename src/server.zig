@@ -19129,12 +19129,32 @@ fn getOrInitBranches(io: std.Io, gpa: std.mem.Allocator) *branches_mod.Registry 
     return &g_branches.?;
 }
 
-/// The snapshot side of the branch routes: `HotPrefixCache` pins, run on the inference
-/// thread. Null until the snapshot store serves pins, so the pinning routes answer 501.
-fn branchStoreFor(lm: *LoadedModel) ?branches_mod.Store {
-    _ = lm;
-    return null;
-}
+/// The snapshot side of the branch routes: the model's `HotPrefixCache` pins, each op a
+/// `PinRequest` the inference thread runs between steps.
+const SchedulerPins = struct {
+    sch: *scheduler_mod.Scheduler,
+    lm: *LoadedModel,
+
+    fn store(self: *SchedulerPins) branches_mod.Store {
+        return .{ .ctx = self, .sessionHead = sessionHead, .pin = pin, .unpin = unpin };
+    }
+    fn run(ctx: *anyopaque, gpa: std.mem.Allocator, op: @FieldType(scheduler_mod.PinRequest, "op")) !scheduler_mod.PinRequest {
+        const self: *SchedulerPins = @ptrCast(@alignCast(ctx));
+        var req: scheduler_mod.PinRequest = .{ .model = self.lm, .op = op, .allocator = gpa };
+        try self.sch.runPinOp(&req);
+        return req;
+    }
+    fn sessionHead(ctx: *anyopaque, gpa: std.mem.Allocator, key: u64) anyerror!?[]u32 {
+        return (try run(ctx, gpa, .{ .head = key })).head;
+    }
+    fn pin(ctx: *anyopaque, key: u64, tokens: []const u32) anyerror!branches_mod.PinId {
+        return (try run(ctx, std.heap.page_allocator, .{ .pin = .{ .key = key, .tokens = tokens } })).pinned;
+    }
+    fn unpin(ctx: *anyopaque, id: branches_mod.PinId) void {
+        _ = run(ctx, std.heap.page_allocator, .{ .unpin = id }) catch |err|
+            log.warn("[branches] unpin {d} failed: {s}\n", .{ id, @errorName(err) });
+    }
+};
 
 const BranchArgs = struct { session_id: []const u8, branch_id: ?u64, label: []const u8 };
 
@@ -19164,6 +19184,8 @@ fn sendBranchError(allocator: std.mem.Allocator, stream: *Conn, err: anyerror) !
         error.NoCheckpointAt => .{ "409 Conflict", "invalid_request_error", "No restorable snapshot at this position; branch at a message boundary or right after a turn", 409 },
         error.TooManyBranches => .{ "429 Too Many Requests", "rate_limit_error", "Too many open branches in this session", 429 },
         error.TooManySessions => .{ "429 Too Many Requests", "rate_limit_error", "Too many sessions with open branches", 429 },
+        error.NoPrefixCache => .{ "501 Not Implemented", "not_implemented", "This model has no prefix cache to pin branches in", 501 },
+        error.Shutdown => .{ "503 Service Unavailable", "shutting_down", "Server is shutting down", 503 },
         else => return err,
     };
     try sendErrorResponse(allocator, stream, status, kind, msg, code);
@@ -19199,15 +19221,21 @@ fn handleBranchRoute(allocator: std.mem.Allocator, stream: *Conn, method: []cons
         try reg.writeList(key, sid_json, &out.writer);
         return sendResponse(stream, "200 OK", "application/json", out.written());
     }
-    const st = branchStoreFor(lm) orelse
-        return sendErrorResponse(allocator, stream, "501 Not Implemented", "not_implemented", "Branch snapshots are not available for this model yet", 501);
+    var pins: SchedulerPins = .{ .sch = global_scheduler orelse
+        return sendErrorResponse(allocator, stream, "503 Service Unavailable", "internal_error", "Scheduler not ready", 503), .lm = lm };
+    const st = pins.store();
 
     if (!is_return and std.mem.eql(u8, method, "POST")) {
-        const head = st.sessionHead(st.ctx, key) orelse return sendBranchError(allocator, stream, error.NoHistory);
-        const pin = st.pin(st.ctx, key, head[0..reg.branchPos(key, head.len)]) catch |err| return sendBranchError(allocator, stream, err);
+        const head = (st.sessionHead(st.ctx, allocator, key) catch |err| return sendBranchError(allocator, stream, err)) orelse
+            return sendBranchError(allocator, stream, error.NoHistory);
+        defer allocator.free(head);
+        const pos = reg.branchPos(key, head.len);
+        const pin = st.pin(st.ctx, key, head[0..pos]) catch |err| return sendBranchError(allocator, stream, err);
+        // Pins are idempotent per prefix: one this session already holds is not ours to drop.
+        const held = reg.holds(key, pin);
         var old: ?branches_mod.PinId = null;
-        const b = reg.open(key, pin, args.label, io_util.nowMs(stream.io), &old) catch |err| {
-            st.unpin(st.ctx, pin);
+        const b = reg.open(key, pin, pos, args.label, io_util.nowMs(stream.io), &old) catch |err| {
+            if (!held) st.unpin(st.ctx, pin);
             return sendBranchError(allocator, stream, err);
         };
         if (old) |p| st.unpin(st.ctx, p);
@@ -19223,7 +19251,7 @@ fn handleBranchRoute(allocator: std.mem.Allocator, stream: *Conn, method: []cons
             for (released.items) |p| st.unpin(st.ctx, p);
             try out.writer.print("{{\"id\":\"br_{d}\",\"object\":\"branch.return\",\"position\":{d},\"closed\":{d}}}", .{ b.id, b.pos, released.items.len });
         } else {
-            st.unpin(st.ctx, reg.drop(key, id) catch |err| return sendBranchError(allocator, stream, err));
+            if (reg.drop(key, id) catch |err| return sendBranchError(allocator, stream, err)) |p| st.unpin(st.ctx, p);
             try out.writer.print("{{\"id\":\"br_{d}\",\"object\":\"branch\",\"deleted\":true}}", .{id});
         }
     }

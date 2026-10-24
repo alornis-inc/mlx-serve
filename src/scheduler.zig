@@ -1184,6 +1184,26 @@ pub const EmbedRequest = struct {
     done_cond: std.Io.Condition = .init,
 };
 
+/// A context-folding pin op (`branches.Store`): posted by the branch routes and run between
+/// steps on the inference thread, which owns the hot cache. The conn thread holds a refcount
+/// on `model` and waits on `done`; the request lives on its stack.
+pub const PinRequest = struct {
+    model: *model_registry_mod.LoadedModel,
+    op: union(enum) {
+        head: u64,
+        pin: struct { key: u64, tokens: []const u32 },
+        unpin: u64,
+    },
+    allocator: std.mem.Allocator,
+    /// `head`: a copy of the session's newest committed tokens, in `allocator`; null = none.
+    head: ?[]u32 = null,
+    pinned: u64 = 0,
+    err: ?anyerror = null,
+    done: bool = false,
+    done_mu: std.Io.Mutex = .init,
+    done_cond: std.Io.Condition = .init,
+};
+
 /// Plan 05 Phase D: cold-load work item. Posted by `Scheduler.ensureLoaded`
 /// when a request targets an `.unloaded` (or freshly-evicted) entry; the
 /// inference thread drains the queue between ticks. The conn thread parses
@@ -1525,6 +1545,8 @@ pub const Scheduler = struct {
     /// Pending embedding requests (encoder-only models). Same shape as
     /// vision_queue; serviced inline between decode ticks.
     embed_queue: std.ArrayList(*EmbedRequest),
+    /// Pending context-folding pin ops (`PinRequest`); serviced between decode ticks.
+    pin_queue: std.ArrayList(*PinRequest),
     /// Phase D: pending cold-load requests. Conn threads post here via
     /// `scheduler.ensureLoaded`; the inference thread drains between ticks
     /// (load runs after cleanup + vision/embed, before prefill). Multiple
@@ -1681,6 +1703,7 @@ pub const Scheduler = struct {
             .decoding = std.ArrayList(*Slot).empty,
             .vision_queue = std.ArrayList(*VisionEncodeRequest).empty,
             .embed_queue = std.ArrayList(*EmbedRequest).empty,
+            .pin_queue = std.ArrayList(*PinRequest).empty,
             .load_queue = std.ArrayList(*LoadRequest).empty,
             .gen_queue = std.ArrayList(*GenRequest).empty,
             .unload_queue = std.ArrayList(*UnloadRequest).empty,
@@ -1775,6 +1798,14 @@ pub const Scheduler = struct {
             req.done_mu.unlock(self.io);
         }
         self.embed_queue.deinit(self.allocator);
+        for (self.pin_queue.items) |req| {
+            req.done_mu.lockUncancelable(self.io);
+            req.err = error.Shutdown;
+            req.done = true;
+            req.done_cond.broadcast(self.io);
+            req.done_mu.unlock(self.io);
+        }
+        self.pin_queue.deinit(self.allocator);
         // Phase D: signal any pending cold-load requesters that the
         // server is shutting down. They roll back their entry state and
         // free pre-loaded CPU resources.
@@ -2425,6 +2456,21 @@ pub const Scheduler = struct {
         defer self.registry.mutex.unlock(self.io);
         const entry = self.registry.pickLruEvictable(keep, false) orelse return null;
         return entry.id;
+    }
+
+    /// Run one pin op on the inference thread and wait for it.
+    pub fn runPinOp(self: *Scheduler, req: *PinRequest) !void {
+        {
+            self.queue_mu.lockUncancelable(self.io);
+            defer self.queue_mu.unlock(self.io);
+            if (self.shutdown.load(.acquire)) return error.Shutdown;
+            try self.pin_queue.append(self.allocator, req);
+            self.queue_cond.broadcast(self.io);
+        }
+        req.done_mu.lockUncancelable(self.io);
+        defer req.done_mu.unlock(self.io);
+        while (!req.done) req.done_cond.waitUncancelable(self.io, &req.done_mu);
+        if (req.err) |e| return e;
     }
 
     /// Synchronously compute embeddings for `req.token_seqs` using the
@@ -5695,6 +5741,7 @@ fn hasWorkPendingLocked(sch: *const Scheduler) bool {
         sch.decoding.items.len > 0 or
         sch.vision_queue.items.len > 0 or
         sch.embed_queue.items.len > 0 or
+        sch.pin_queue.items.len > 0 or
         sch.cleanup_queue.items.len > 0 or
         sch.load_queue.items.len > 0 or
         sch.gen_queue.items.len > 0 or
@@ -5834,6 +5881,8 @@ fn drainSideQueues(sch: *Scheduler) bool {
     var vision_n: usize = 0;
     var embed_batch: [4]*EmbedRequest = undefined;
     var embed_n: usize = 0;
+    var pin_batch: [8]*PinRequest = undefined;
+    var pin_n: usize = 0;
     {
         sch.queue_mu.lockUncancelable(sch.io);
         defer sch.queue_mu.unlock(sch.io);
@@ -5848,6 +5897,10 @@ fn drainSideQueues(sch: *Scheduler) bool {
         while (embed_n < embed_batch.len and sch.embed_queue.items.len > 0) {
             embed_batch[embed_n] = sch.embed_queue.orderedRemove(0);
             embed_n += 1;
+        }
+        while (pin_n < pin_batch.len and sch.pin_queue.items.len > 0) {
+            pin_batch[pin_n] = sch.pin_queue.orderedRemove(0);
+            pin_n += 1;
         }
     }
     for (cleanup_batch[0..cleanup_n]) |s| {
@@ -5877,7 +5930,34 @@ fn drainSideQueues(sch: *Scheduler) bool {
     }
     for (vision_batch[0..vision_n]) |req| runVisionEncode(sch, req);
     for (embed_batch[0..embed_n]) |req| runEmbedRequest(sch, req);
-    return cleanup_n + vision_n + embed_n > 0;
+    for (pin_batch[0..pin_n]) |req| runPinRequest(sch, req);
+    return cleanup_n + vision_n + embed_n + pin_n > 0;
+}
+
+fn runPinRequest(sch: *Scheduler, req: *PinRequest) void {
+    req.done_mu.lockUncancelable(sch.io);
+    defer req.done_mu.unlock(sch.io);
+    defer {
+        req.done = true;
+        req.done_cond.broadcast(sch.io);
+    }
+    const hc = if (req.model.prefix_cache) |*h| h else {
+        req.err = error.NoPrefixCache;
+        return;
+    };
+    switch (req.op) {
+        .head => |key| if (hc.sessionHead(key)) |t| {
+            req.head = req.allocator.dupe(u32, t) catch |err| {
+                req.err = err;
+                return;
+            };
+        },
+        .pin => |p| req.pinned = hc.pin(p.key, p.tokens) catch |err| {
+            req.err = err;
+            return;
+        },
+        .unpin => |id| _ = hc.unpin(id),
+    }
 }
 
 const ChatPassMode = enum { main, yield };

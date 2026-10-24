@@ -29,14 +29,15 @@ All bodies are JSON. `GET` and `DELETE` also read `session_id` and `branch_id` f
 | Route | Body | Result |
 |---|---|---|
 | `POST /branch` | `session_id`, optional `label` | `{"id":"br_N","object":"branch","position":P,"depth":0,"created":T,"label":…}`. P is the end of the session's last turn (prompt + generated), or the anchor after a `/return`. |
-| `POST /return` | `session_id`, `branch_id` | `{"id":"br_N","object":"branch.return","position":P,"closed":K}`. Closes this branch and every branch opened after it, and releases K pins. The harness then sends `history[0..P] + summary`. |
+| `POST /return` | `session_id`, `branch_id` | `{"id":"br_N","object":"branch.return","position":P,"closed":K}`. Closes this branch and every branch opened after it, and releases K pins (a pin
+shared by two branches at the same position is released only once neither holds it). The harness then sends `history[0..P] + summary`. |
 | `GET /branches?session_id=` | | `{"object":"list","session_id":…,"data":[…]}`, outermost first, with `depth` set. |
 | `DELETE /branch` | `session_id`, `branch_id` | `{"id":"br_N","object":"branch","deleted":true}`. Unpins without folding. |
 
 Errors: 400 when `session_id` or `branch_id` is missing; 404 for an unknown branch, including
 one that belongs to another session (ownership is never revealed); 409 when the session has no
-turn yet or there is no checkpoint at that position; 429 past 32 open branches per session or
-256 sessions; 501 until the snapshot store serves pins.
+turn yet or there is no checkpoint at that position; 429 past 15 open branches per session (the store keeps
+16 pins per session, including the anchor) or 256 sessions; 501 when the model has no prefix cache.
 
 ## Harness flow
 
@@ -57,9 +58,12 @@ fork its own `prompt_cache_key` (for example `<worker>/fork-k`), so eviction sta
 
 ## Still to do
 
-- `branchStoreFor` returns null until `HotPrefixCache.sessionHead / pin / unpin` land
-  (owned by the snapshot thread). Those calls then hop onto the inference thread through a
-  scheduler queue, like `unloadModel` does.
+- Wired: pin ops run on the inference thread through `Scheduler.runPinOp` (a `PinRequest`
+  drained in `drainSideQueues`, between steps), against `HotPrefixCache.sessionHead / pin /
+  unpin` from `feat/gdn-snapshots`.
+- `sessionHead` returns null once SSD-first has spilled the session's newest entry out of RAM,
+  so `/branch` answers 409. Fix: let `/branch` take the harness's `messages`, render them, and
+  pin that prefix.
 - The registry is per server, not per model. A session that switches models would pin
   against the wrong cache.
 - A session that returns and never branches again holds its anchor until the server restarts.
