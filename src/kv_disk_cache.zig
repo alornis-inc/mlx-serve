@@ -2984,13 +2984,18 @@ pub const DiskTier = struct {
         return e.tokens;
     }
 
-    /// The LRU record, pin keepers (`PinSet.keeps`) skipped when `skip_keepers`: a branch
-    /// point's record goes last, but the byte budget still holds.
-    fn lruIndexPinAware(self: *const DiskTier, skip_keepers: bool) ?usize {
+    fn indexEntryHasCheckpointAt(e: *const IndexEntry, pos: usize) bool {
+        const p = std.math.cast(u32, pos) orelse return false;
+        return !e.poisoned and e.kv_len >= p and std.mem.indexOfScalar(u32, e.ssm_positions, p) != null;
+    }
+
+    /// The LRU record, pin keepers (`PinSet.keeperMask`) skipped when `keepers` is given: a
+    /// branch point's record goes last, but the byte budget still holds.
+    fn lruIndexPinAware(self: *const DiskTier, keepers: ?[]const bool) ?usize {
         var lru_idx: ?usize = null;
         var lru_used: u64 = std.math.maxInt(u64);
         for (self.entries.items, 0..) |*e, i| {
-            if (skip_keepers) if (self.pins) |ps| if (ps.pins.items.len > 0 and ps.keeps(self.entries.items, i, indexEntryTokens)) continue;
+            if (keepers) |k| if (k[i]) continue;
             if (e.last_used < lru_used) {
                 lru_used = e.last_used;
                 lru_idx = i;
@@ -3002,7 +3007,16 @@ pub const DiskTier = struct {
     fn gcToBudget(self: *DiskTier) void {
         if (self.max_bytes == 0) return;
         while (self.total_bytes > self.max_bytes and self.entries.items.len > 1) {
-            const victim = self.lruIndexPinAware(true) orelse self.lruIndexPinAware(false).?;
+            // One keeper scan per eviction; an allocation failure only loses the preference.
+            var keepers: std.ArrayList(bool) = .empty;
+            defer keepers.deinit(self.allocator);
+            if (self.pins) |ps| if (ps.pins.items.len > 0) {
+                if (keepers.resize(self.allocator, self.entries.items.len)) |_| {
+                    ps.keeperMask(self.entries.items, indexEntryTokens, indexEntryHasCheckpointAt, keepers.items);
+                } else |_| keepers.clearRetainingCapacity();
+            }
+            const k: ?[]const bool = if (keepers.items.len > 0) keepers.items else null;
+            const victim = self.lruIndexPinAware(k) orelse self.lruIndexPinAware(null).?;
             const mb = @as(f64, @floatFromInt(self.entries.items[victim].bytes)) / (1024.0 * 1024.0);
             log.info("  [disk-cache] evicted LRU entry (byte budget; {d:.1} MB)\n", .{mb});
             self.removeAt(victim);

@@ -590,12 +590,30 @@ pub const HotPrefixCache = struct {
         return e.tokens;
     }
 
-    /// Is `entries[idx]` some pin's keeper (`PinSet.keeps`)? Eviction PREFERS other victims;
-    /// it never refuses one, so a full set of pinned entries cannot push past the budget.
+    fn entryHasCheckpointAt(e: *const Entry, pos: usize) bool {
+        const cps = e.ssm_checkpoints orelse return false;
+        for (cps) |*cp| if (cp.pos == pos) return true;
+        return false;
+    }
+
+    /// Max entries a keeper mask covers on the stack (the count cap is far below it).
+    const KEEPER_MASK_MAX: usize = 256;
+
+    /// The pin keepers among the entries (`PinSet.keeperMask`), computed once per eviction scan;
+    /// null = no pin applies. Eviction PREFERS other victims and never refuses a keeper, so a
+    /// full set of pinned entries cannot push past the budget.
+    fn keeperMask(self: *const HotPrefixCache, buf: *[KEEPER_MASK_MAX]bool) ?[]const bool {
+        const ps = self.pins orelse return null;
+        const n = self.entries.items.len;
+        if (ps.pins.items.len == 0 or n > KEEPER_MASK_MAX) return null;
+        ps.keeperMask(self.entries.items, entryTokens, entryHasCheckpointAt, buf[0..n]);
+        return buf[0..n];
+    }
+
     fn keepsPin(self: *const HotPrefixCache, idx: usize) bool {
-        const ps = self.pins orelse return false;
-        if (ps.pins.items.len == 0) return false;
-        return ps.keeps(self.entries.items, idx, entryTokens);
+        var buf: [KEEPER_MASK_MAX]bool = undefined;
+        const m = self.keeperMask(&buf) orelse return false;
+        return m[idx];
     }
 
     /// The thinning pick for `cps` (a list of a record of `tokens`), honouring pins. Null =
@@ -2486,6 +2504,8 @@ pub const HotPrefixCache = struct {
     }
 
     fn oldestIdleIndexPinAware(self: *HotPrefixCache, newest_used: u64, durable_only: bool, skip_keepers: bool) ?usize {
+        var kbuf: [KEEPER_MASK_MAX]bool = undefined;
+        const keepers: ?[]const bool = if (skip_keepers) self.keeperMask(&kbuf) else null;
         var best: ?usize = null;
         var best_used: u64 = std.math.maxInt(u64);
         for (self.entries.items, 0..) |*e, i| {
@@ -2493,7 +2513,7 @@ pub const HotPrefixCache = struct {
             if (e.checked_out_by != null) continue;
             if (durable_only and !e.spill_durable) continue;
             if (!durable_only and e.media.len != 0 and !e.spill_durable) continue;
-            if (skip_keepers and self.keepsPin(i)) continue;
+            if (keepers) |k| if (k[i]) continue;
             if (e.last_used < best_used) {
                 best_used = e.last_used;
                 best = i;
@@ -3181,11 +3201,13 @@ pub const HotPrefixCache = struct {
     fn lruIndexExcluding(self: *const HotPrefixCache, protect: ?u64, incoming_key: ?u64) ?usize {
         // Pin keepers go last, never not at all: the byte budget is a hard cap (Metal does not
         // survive an OOM), and SSD-first spills a keeper whole before this ever runs on it.
-        return self.lruIndexPinAware(protect, incoming_key, true) orelse
-            self.lruIndexPinAware(protect, incoming_key, false);
+        if (self.lruIndexPinAware(protect, incoming_key, true)) |i| return i;
+        return self.lruIndexPinAware(protect, incoming_key, false);
     }
 
     fn lruIndexPinAware(self: *const HotPrefixCache, protect: ?u64, incoming_key: ?u64, skip_keepers: bool) ?usize {
+        var kbuf: [KEEPER_MASK_MAX]bool = undefined;
+        const keepers: ?[]const bool = if (skip_keepers) self.keeperMask(&kbuf) else null;
         var best: ?usize = null;
         var best_used: u64 = std.math.maxInt(u64);
         var max_count: usize = 0;
@@ -3195,7 +3217,7 @@ pub const HotPrefixCache = struct {
             if (protect) |p| {
                 if (e.last_used == p) continue;
             }
-            if (skip_keepers and self.keepsPin(i)) continue;
+            if (keepers) |k| if (k[i]) continue;
             var count: usize = if (incoming_key != null and incoming_key.? == e.cache_key) 1 else 0;
             for (self.entries.items) |*o| {
                 if (o.checked_out_by != null or o.cache_key != e.cache_key) continue;

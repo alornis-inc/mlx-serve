@@ -105,27 +105,33 @@ pub const PinSet = struct {
         return pin.pos <= tokens.len and pin.digest == prefixDigest(tokens[0..pin.pos]);
     }
 
-    /// Is the record `records[idx]` some pin's KEEPER: the shortest record covering it (the
-    /// lowest index on a tie)? Only keepers are preferred over other eviction victims; a longer
-    /// record of the same session (the investigation itself) is ordinary prey. `tokensOf` maps a
-    /// record to its tokens.
-    pub fn keeps(self: *const PinSet, records: anytype, idx: usize, comptime tokensOf: anytype) bool {
-        const mine = tokensOf(&records[idx]);
+    /// `out[i]` = is `records[i]` some pin's KEEPER: the shortest record that covers the pin AND
+    /// holds a checkpoint exactly at it (`hasCheckpointAt(record, pos)`; the lowest index on a
+    /// tie). Eviction prefers every other victim; a longer record of the same session (the
+    /// investigation itself) is ordinary prey. One pass per pin; the length and the checkpoint
+    /// test run before the digest, and only a record shorter than the best so far is hashed.
+    pub fn keeperMask(
+        self: *const PinSet,
+        records: anytype,
+        comptime tokensOf: anytype,
+        comptime hasCheckpointAt: anytype,
+        out: []bool,
+    ) void {
+        std.debug.assert(out.len == records.len);
+        @memset(out, false);
         for (self.pins.items) |p| {
-            if (!covers(p, mine)) continue;
-            var shortest = true;
-            for (records, 0..) |*r, j| {
-                if (j == idx) continue;
-                const other = tokensOf(r);
-                if (other.len > mine.len or (other.len == mine.len and j > idx)) continue;
-                if (covers(p, other)) {
-                    shortest = false;
-                    break;
-                }
+            var best: ?usize = null;
+            var best_len: usize = std.math.maxInt(usize);
+            for (records, 0..) |*r, i| {
+                const toks = tokensOf(r);
+                if (toks.len < p.pos or toks.len >= best_len) continue;
+                if (!hasCheckpointAt(r, p.pos)) continue;
+                if (!covers(p, toks)) continue;
+                best = i;
+                best_len = toks.len;
             }
-            if (shortest) return true;
+            if (best) |b| out[b] = true;
         }
-        return false;
     }
 
     /// `out[i]` = is `positions[i]` pinned for `tokens`. `positions` may be any integer slice.
@@ -137,6 +143,12 @@ pub const PinSet = struct {
 
 fn sliceOf(r: *const []const u32) []const u32 {
     return r.*;
+}
+fn everyPos(_: *const []const u32, _: usize) bool {
+    return true;
+}
+fn onlyFull(r: *const []const u32, _: usize) bool {
+    return r.len == 6;
 }
 
 test "PinSet: content-addressed, per-key cap, session drop" {
@@ -154,17 +166,21 @@ test "PinSet: content-addressed, per-key cap, session drop" {
     try t.expect(PinSet.covers(set.pins.items[0], &toks));
     try t.expect(!PinSet.covers(set.pins.items[0], &other));
     try t.expect(!PinSet.covers(set.pins.items[0], toks[0..3]));
-    // Keeper = the shortest record covering the pin; a longer one of the session is not.
+    // Keeper = the shortest record covering the pin that holds a checkpoint at it.
     const records = [_][]const u32{ &toks, toks[0..5], &other };
-    try t.expect(!set.keeps(&records, 0, sliceOf));
-    try t.expect(set.keeps(&records, 1, sliceOf));
-    try t.expect(!set.keeps(&records, 2, sliceOf));
+    var km: [3]bool = undefined;
+    set.keeperMask(&records, sliceOf, everyPos, &km);
+    try t.expectEqualSlices(bool, &.{ false, true, false }, &km);
+    // The shorter record has no checkpoint at the pin: the longer one that does is the keeper.
+    set.keeperMask(&records, sliceOf, onlyFull, &km);
+    try t.expectEqualSlices(bool, &.{ true, false, false }, &km);
     var m: [3]bool = undefined;
     set.mask(&toks, &[_]u32{ 2, 4, 6 }, &m);
     try t.expectEqualSlices(bool, &.{ false, true, false }, &m);
     try t.expect(set.remove(a));
     try t.expect(!set.remove(a));
-    try t.expect(!set.keeps(&records, 1, sliceOf));
+    set.keeperMask(&records, sliceOf, everyPos, &km);
+    try t.expectEqualSlices(bool, &.{ false, false, false }, &km);
 
     var long: [MAX_PINS_PER_KEY + 2]u32 = undefined;
     for (&long, 0..) |*x, i| x.* = @intCast(i);
