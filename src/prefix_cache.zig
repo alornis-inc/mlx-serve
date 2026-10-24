@@ -23,6 +23,7 @@ const kv_disk_cache = @import("kv_disk_cache.zig");
 const io_util = @import("io_util.zig");
 const log = @import("log.zig");
 const restore_dump = @import("restore_dump.zig");
+const cache_pins = @import("cache_pins.zig");
 
 const KVCache = transformer_mod.KVCache;
 const KVCacheSnapshot = transformer_mod.KVCacheSnapshot;
@@ -533,6 +534,10 @@ pub const HotPrefixCache = struct {
     finishing_disk: ?PendingDiskFlush = null,
     /// Byte floor for `restoreWouldPinEntry`; a field so a test can reproduce the live shape.
     restore_pin_min_bytes: u64 = RESTORE_PIN_MIN_BYTES,
+    /// Context-folding pins (`cache_pins.zig`), heap-held so the disk tier can share the
+    /// pointer; created by the first `pin`. Pinned checkpoints outrank every thinning cap and
+    /// an entry holding one is never evicted (RAM: unless the SSD tier holds it whole).
+    pins: ?*cache_pins.PinSet = null,
 
     pub fn init(allocator: std.mem.Allocator, max_entries: u32) HotPrefixCache {
         return initWithMem(allocator, max_entries, 0);
@@ -557,6 +562,42 @@ pub const HotPrefixCache = struct {
         self.dropPendingSnapshots();
         if (self.disk) |*d| d.deinit();
         self.disk = null;
+        if (self.pins) |ps| {
+            ps.deinit();
+            self.allocator.destroy(ps);
+            self.pins = null;
+        }
+    }
+
+    /// Max checkpoints a pin mask covers on the stack; a longer list thins without pins (every
+    /// retention cap is far below it).
+    const PIN_MASK_MAX: usize = 256;
+
+    /// `buf[0..cps.len]` marks the pinned checkpoints of a record of `tokens`; null = no pin
+    /// applies (no pins, or a list past `PIN_MASK_MAX`), so the plain thinning runs.
+    fn pinMask(self: *const HotPrefixCache, tokens: []const u32, cps: []const SSMCheckpoint, buf: *[PIN_MASK_MAX]bool) ?[]const bool {
+        const ps = self.pins orelse return null;
+        if (ps.pins.items.len == 0 or cps.len > PIN_MASK_MAX) return null;
+        var any = false;
+        for (cps, buf[0..cps.len]) |*cp, *m| {
+            m.* = ps.pinnedAt(tokens, cp.pos);
+            any = any or m.*;
+        }
+        return if (any) buf[0..cps.len] else null;
+    }
+
+    fn holdsPin(self: *const HotPrefixCache, tokens: []const u32) bool {
+        const ps = self.pins orelse return false;
+        return ps.holds(tokens);
+    }
+
+    /// The thinning pick for `cps` (a list of a record of `tokens`), honouring pins. Null =
+    /// everything left is pinned: the list stays over its cap.
+    fn thinDropIndex(self: *const HotPrefixCache, tokens: []const u32, cps: []const SSMCheckpoint, protect: ?usize) ?usize {
+        var buf: [PIN_MASK_MAX]bool = undefined;
+        if (self.pinMask(tokens, cps, &buf)) |m|
+            return transformer_mod.ssmCheckpointDropIndexPinned(cps, self.cp_thin, protect, self.ssm_low_anchors, m);
+        return transformer_mod.ssmCheckpointDropIndexLowAnchored(cps, self.cp_thin, protect, self.ssm_low_anchors);
     }
 
     fn dropPendingSnapshots(self: *HotPrefixCache) void {
@@ -1997,7 +2038,7 @@ pub const HotPrefixCache = struct {
             }
             if (eff_cps) |own| {
                 // Consumes both on every path; on error neither survives.
-                const merged = self.mergeCheckpointLists(cloned, own, firstSpanStart(eff_media)) catch |err| {
+                const merged = self.mergeCheckpointLists(eff_tokens, cloned, own, firstSpanStart(eff_media)) catch |err| {
                     log.warn("  [hot-cache] checkpoint merge failed: {s}\n", .{@errorName(err)});
                     eff_cps = null;
                     new_bytes -= new_ssm_bytes;
@@ -2058,7 +2099,7 @@ pub const HotPrefixCache = struct {
                 // not touch it.
                 e.ssm_checkpoints = null;
                 const new = eff_cps orelse break :blk old;
-                break :blk try self.mergeCheckpointLists(old, new, firstSpanStart(eff_media));
+                break :blk try self.mergeCheckpointLists(eff_tokens, old, new, firstSpanStart(eff_media));
             };
 
             // Free everything the old entry owned EXCEPT the (now-detached)
@@ -2439,6 +2480,8 @@ pub const HotPrefixCache = struct {
             if (e.checked_out_by != null) continue;
             if (durable_only and !e.spill_durable) continue;
             if (!durable_only and e.media.len != 0 and !e.spill_durable) continue;
+            // A pinned branch point with no durable copy stays: this RAM entry is its only home.
+            if (!durable_only and self.holdsPin(e.tokens)) continue;
             if (e.last_used < best_used) {
                 best_used = e.last_used;
                 best = i;
@@ -2623,6 +2666,7 @@ pub const HotPrefixCache = struct {
         self.ssd_first = ssdFirstActive(config, self.disk != null, self.ram_enabled);
         const d = if (self.disk) |*dd| dd else return;
         d.ssd_first = self.ssd_first;
+        d.pins = self.pins;
         d.enableBackgroundWriter();
         // Startup sweep of strays + root-wide LRU across sibling fingerprints.
         if (self.ssd_first) d.sweepSiblings();
@@ -2660,6 +2704,8 @@ pub const HotPrefixCache = struct {
     /// `transformer.ssmCheckpointDropIndex`, shared with every other thinning site.
     fn mergeCheckpointLists(
         self: *HotPrefixCache,
+        /// The record the merged list belongs to: pins are keyed on its tokens.
+        tokens: []const u32,
         old: []SSMCheckpoint,
         new: []SSMCheckpoint,
         media_start: ?usize,
@@ -2710,12 +2756,7 @@ pub const HotPrefixCache = struct {
         {
             // Under three there is no interior to thin; honour the cap by
             // dropping the oldest, which is also the cheapest to redo.
-            const drop = transformer_mod.ssmCheckpointDropIndexLowAnchored(
-                merged.items,
-                self.cp_thin,
-                boundaryCheckpointIndex(merged.items, media_start),
-                self.ssm_low_anchors,
-            );
+            const drop = self.thinDropIndex(tokens, merged.items, boundaryCheckpointIndex(merged.items, media_start)) orelse break;
             var dropped = merged.orderedRemove(drop);
             dropped.deinit(self.allocator);
         }
@@ -2834,12 +2875,7 @@ pub const HotPrefixCache = struct {
         var n = cps.len;
         var shed: usize = 0;
         while (n > 1 and self.current_kv_bytes > self.max_kv_bytes) {
-            const drop = transformer_mod.ssmCheckpointDropIndexLowAnchored(
-                cps[0..n],
-                self.cp_thin,
-                boundaryCheckpointIndex(cps[0..n], firstSpanStart(newest.media)),
-                self.ssm_low_anchors,
-            );
+            const drop = self.thinDropIndex(newest.tokens, cps[0..n], boundaryCheckpointIndex(cps[0..n], firstSpanStart(newest.media))) orelse break;
             const freed = ssmCheckpointBytes(&cps[drop]);
             if (checkpointHasQsaPooled(&cps[drop])) {
                 if (drop > 0) {
@@ -3140,6 +3176,8 @@ pub const HotPrefixCache = struct {
             if (protect) |p| {
                 if (e.last_used == p) continue;
             }
+            // A folding branch point lives here; SSD-first spills it instead (`oldestIdleIndex`).
+            if (self.holdsPin(e.tokens)) continue;
             var count: usize = if (incoming_key != null and incoming_key.? == e.cache_key) 1 else 0;
             for (self.entries.items) |*o| {
                 if (o.checked_out_by != null or o.cache_key != e.cache_key) continue;
@@ -3212,6 +3250,64 @@ pub const HotPrefixCache = struct {
 
     pub fn entryCount(self: *const HotPrefixCache) usize {
         return self.entries.items.len;
+    }
+
+    // ── Context-folding pins (inference thread only, like every other method here) ──
+
+    /// Tokens of `cache_key`'s newest RAM entry (prompt ++ generated of its last committed
+    /// turn). Borrowed until the next commit or eviction. Null: the key has no resident entry
+    /// (anonymous key 0, or SSD-first spilled it), so the caller resends what it holds.
+    pub fn sessionHead(self: *const HotPrefixCache, cache_key: u64) ?[]const u32 {
+        if (cache_key == 0) return null;
+        var best: ?*const Entry = null;
+        for (self.entries.items) |*e| {
+            if (e.cache_key != cache_key) continue;
+            if (best == null or e.last_used > best.?.last_used) best = e;
+        }
+        return if (best) |e| e.tokens else null;
+    }
+
+    /// Does some record restore EXACTLY the state after `tokens`: a checkpoint at `tokens.len`
+    /// in an entry whose tokens start with `tokens` (RAM tier, then the SSD tier)?
+    pub fn checkpointExactlyAt(self: *const HotPrefixCache, tokens: []const u32) bool {
+        for (self.entries.items) |*e| {
+            if (e.tokens.len < tokens.len or !std.mem.eql(u32, e.tokens[0..tokens.len], tokens)) continue;
+            const cps = e.ssm_checkpoints orelse continue;
+            for (cps) |*cp| if (cp.pos == tokens.len) return true;
+        }
+        if (self.disk) |*d| return d.hasCheckpointAt(tokens);
+        return false;
+    }
+
+    /// Pin the state after `tokens` for `cache_key`: from now on its checkpoint outranks every
+    /// thinning cap and the records holding it are never evicted, on either tier, until
+    /// `unpin` / `unpinSession`. Branch where a checkpoint already sits: a message start
+    /// (`generate.messageBoundaries`) or the decode end of the session's last turn
+    /// (`sessionHead`). Re-pinning the same prefix returns the same id.
+    pub fn pin(self: *HotPrefixCache, cache_key: u64, tokens: []const u32) !cache_pins.PinId {
+        if (!self.checkpointExactlyAt(tokens)) return error.NoCheckpointAt;
+        const ps = self.pins orelse blk: {
+            const p = try self.allocator.create(cache_pins.PinSet);
+            p.* = cache_pins.PinSet.init(self.allocator);
+            self.pins = p;
+            if (self.disk) |*d| d.pins = p;
+            break :blk p;
+        };
+        const id = try ps.add(cache_key, tokens);
+        log.info("  [hot-cache] pinned {d} tokens (pin {d}, {d} for this session)\n", .{ tokens.len, id, ps.countKey(cache_key) });
+        return id;
+    }
+
+    /// Release one pin. False = unknown id (already released, or displaced by the per-key cap).
+    pub fn unpin(self: *HotPrefixCache, id: cache_pins.PinId) bool {
+        const ps = self.pins orelse return false;
+        return ps.remove(id);
+    }
+
+    /// Session end: release every pin of `cache_key`.
+    pub fn unpinSession(self: *HotPrefixCache, cache_key: u64) usize {
+        const ps = self.pins orelse return 0;
+        return ps.removeKey(cache_key);
     }
 };
 
@@ -4537,6 +4633,59 @@ test "HotPrefixCache: thinning keeps the highest checkpoint below the media boun
     const boundary_cp = HotPrefixCache.highestCheckpointAtOrBelow(kept, media_start) orelse
         return error.BoundaryCheckpointDropped;
     try testing.expectEqual(@as(usize, 6), boundary_cp.pos);
+}
+
+// Context folding: a pinned branch point survives the merge's thinning, a pin needs an
+// exact checkpoint, and an entry holding a pin is never the LRU victim.
+test "HotPrefixCache: a pinned branch point survives thinning and eviction" {
+    const s = mlx.gpuStream();
+    var tokens: [24]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 1);
+
+    var hc = HotPrefixCache.initWithMem(testing.allocator, 2, 0);
+    hc.ssm_checkpoint_max = 3;
+    defer hc.deinit();
+
+    var ssm = pcBuildHybrid(s, 100.0, 500.0);
+    defer pcFreeHybrid(&ssm);
+
+    const key: u64 = 0xF01D;
+    var c1 = try KVCache.init(testing.allocator, 3);
+    defer c1.deinit();
+    try testFillCache(&c1, s, 3, 16);
+    const first = try testing.allocator.alloc(SSMCheckpoint, 3);
+    for (first, 0..) |*c, i| c.* = try transformer_mod.captureSsmCheckpoint(testing.allocator, &ssm, 2 + i * 2, s);
+    _ = try hc.commitWithMediaState(&c1, tokens[0..16], false, &.{}, key, first, null, null, 16);
+
+    try testing.expectEqualSlices(u32, tokens[0..16], hc.sessionHead(key).?);
+    try testing.expectEqual(@as(?[]const u32, null), hc.sessionHead(key + 1));
+    // No checkpoint sits at 5: no pin.
+    try testing.expectError(error.NoCheckpointAt, hc.pin(key, tokens[0..5]));
+    const id = try hc.pin(key, tokens[0..4]);
+
+    // The next turn merges seven checkpoints down to three; the plain thinning drops 4.
+    var c2 = try KVCache.init(testing.allocator, 3);
+    defer c2.deinit();
+    try testFillCache(&c2, s, 3, 24);
+    const second = try testing.allocator.alloc(SSMCheckpoint, 4);
+    for (second, 0..) |*c, i| c.* = try transformer_mod.captureSsmCheckpoint(testing.allocator, &ssm, 12 + i * 2, s);
+    _ = try hc.commitWithMediaState(&c2, &tokens, false, &.{}, key, second, null, null, tokens.len);
+
+    try testing.expectEqual(@as(usize, 1), hc.entryCount());
+    const kept = hc.entries.items[0].ssm_checkpoints.?;
+    try testing.expectEqual(@as(usize, 3), kept.len);
+    var has4 = false;
+    for (kept) |*cp| has4 = has4 or cp.pos == 4;
+    try testing.expect(has4);
+    // The folded resend restores exactly at the pin.
+    try testing.expect(hc.checkpointExactlyAt(tokens[0..4]));
+
+    // Pinned: never the LRU victim, whatever its age.
+    try testing.expectEqual(@as(?usize, null), hc.lruIndexExcluding(null, null));
+    try testing.expect(hc.unpin(id));
+    try testing.expect(!hc.unpin(id));
+    try testing.expectEqual(@as(?usize, 0), hc.lruIndexExcluding(null, null));
+    try testing.expectEqual(@as(usize, 0), hc.unpinSession(key));
 }
 
 test "HotPrefixCache: hybrid SSM state restores from the SSD tier across a restart" {

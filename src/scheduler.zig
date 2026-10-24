@@ -8666,6 +8666,16 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
         .hc = if (slot.model.prefix_cache) |*p| p else null,
     };
 
+    // Message starts for the boundary checkpoints (context folding). Built before the
+    // checkout transfer below, after which nothing may fail: a failed scan only costs the
+    // exact boundary snapshots, never the request.
+    const turn_start: ?u32 = if (cp_stride > 0) generate_mod.turnStartToken(slot.model.tokenizer.?) else null;
+    const ssm_bounds: []const usize = if (turn_start) |ts|
+        generate_mod.messageBoundaries(slot.allocator, slot.full_prompt, ts) catch &.{}
+    else
+        &.{};
+    defer if (ssm_bounds.len > 0) slot.allocator.free(ssm_bounds);
+
     // Ownership of the restored spec caches transfers AT THE CALL:
     // initWithOptions adopts them and frees them via its own errdefers on
     // any failure past adoption (a mid-prefill disconnect throws
@@ -8725,6 +8735,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
             .ssm_checkpoint_stride = cp_stride,
             .ssm_checkpoint_max = cp_max,
             .ssm_low_anchors = if (xfm_ptr.config.longCtxGated()) kv_disk_cache.SSM_DISK_LOW_ANCHORS else 0,
+            .ssm_boundaries = ssm_bounds,
             .ssm_checkpoint_pos_offset = hot_matched,
             // A restored prefix already holds its image rows: the splice
             // resumes at the placeholder count inside the matched prefix.

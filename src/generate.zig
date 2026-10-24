@@ -1342,6 +1342,69 @@ pub fn ssmSnapshotBackoff(want_ssm_cp: bool, prefix_len: usize, restored: bool) 
     return SSM_SNAPSHOT_BACKOFF;
 }
 
+/// Message-boundary checkpoints (context folding): a harness that drops a run of messages
+/// and resends the history resumes at the first dropped message's start, so the prefill
+/// snapshots EXACTLY there instead of up to a stride below. Only the newest this many
+/// boundaries of the forwarded span cut chunks: each cut is one more chunk, and on MoE every
+/// chunk re-streams the experts, so a cold 200-message prompt must not pay 200 sweeps.
+pub const SSM_BOUNDARY_MAX: usize = 8;
+
+/// Positions `p` with `tokens[p] == turn_start`: the state after `p` tokens is the state
+/// just before that message's header. Ascending; caller frees.
+pub fn messageBoundaries(allocator: std.mem.Allocator, tokens: []const u32, turn_start: u32) ![]usize {
+    var out: std.ArrayList(usize) = .empty;
+    errdefer out.deinit(allocator);
+    for (tokens, 0..) |tok, p| {
+        if (p > 0 and tok == turn_start) try out.append(allocator, p);
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+/// PURE: the boundaries (ABSOLUTE, ascending) this prefill snapshots at: strictly after the
+/// restored prefix `offset` and at most `offset + prefix_len` (the last prompt token always
+/// forwards), the newest `SSM_BOUNDARY_MAX` of them.
+pub fn boundaryWindow(bounds: []const usize, offset: usize, prefix_len: usize) []const usize {
+    var lo: usize = 0;
+    while (lo < bounds.len and bounds[lo] <= offset) lo += 1;
+    var hi: usize = lo;
+    while (hi < bounds.len and bounds[hi] <= offset + prefix_len) hi += 1;
+    return bounds[@max(lo, hi -| SSM_BOUNDARY_MAX)..hi];
+}
+
+/// PURE: end the chunk `[pos, end)` (relative to `prompt_ids[0]`) at the first boundary
+/// strictly inside it. A snapshot may only stamp a position the chunk evaluated.
+pub fn boundaryCutEnd(pos: usize, end: usize, offset: usize, bounds: []const usize) usize {
+    for (bounds) |b| {
+        if (b <= pos + offset) continue;
+        if (b < end + offset) return b - offset;
+        break;
+    }
+    return end;
+}
+
+/// PURE: the chunk loop's end once boundaries are known. The newest boundary inside the
+/// held-back snapshot window replaces the backoff point: the generation prompt's header
+/// starts there, and a warm restore at it forwards the rest as ONE span, exactly the span
+/// this cold run forwards (`ssmSnapshotBackoff(…, restored)`).
+pub fn boundaryLoopEnd(loop_end: usize, offset: usize, bounds: []const usize) usize {
+    if (bounds.len == 0) return loop_end;
+    const last = bounds[bounds.len - 1] - offset;
+    return @max(loop_end, last);
+}
+
+/// The special token that opens every chat turn in this tokenizer's family (ChatML,
+/// Gemma, Llama 3), or null when it has none: then only the stride grid snapshots.
+pub fn turnStartToken(tok: *const Tokenizer) ?u32 {
+    for ([_][]const u8{ "<|im_start|>", "<start_of_turn>", "<|start_header_id|>" }) |name| {
+        if (tok.specialTokenId(name)) |id| return id;
+    }
+    return null;
+}
+
+pub fn isBoundaryPos(bounds: []const usize, abs: usize) bool {
+    return std.mem.indexOfScalar(usize, bounds, abs) != null;
+}
+
 /// Under `longCtxGated` the chunk loop lays dense checkpoint anchors every 8192
 /// through the first 65536, whatever stride the request coarsened to (#794): a
 /// deep entry's grid then always answers `highestSsmPosAtOrBelow` for a fork
@@ -2580,6 +2643,10 @@ pub const Generator = struct {
         /// request that forked below a coarse grid's first multiple (#794).
         /// 0 = the plain thinning (upstream behaviour, byte-identical).
         ssm_low_anchors: usize = 0,
+        /// Message starts (ABSOLUTE positions, ascending, `messageBoundaries`): the prefill
+        /// also cuts and snapshots at the newest of them (`boundaryWindow`). Empty = the
+        /// stride grid only. Borrowed for the duration of init.
+        ssm_boundaries: []const usize = &.{},
         /// Phase 1: absolute position of the FIRST token in `prompt_ids`.
         /// On a cold prefill this is 0. On the warm path (where the
         /// scheduler restored some prefix and now forwards only the tail),
@@ -3024,7 +3091,8 @@ pub const Generator = struct {
         if (final_start > 0) {
             const prefix_len = prompt_ids.len - 1;
             const snapshot_backoff = ssmSnapshotBackoff(want_state_cp, prefix_len, ssm_cp_offset > 0);
-            const loop_end = prefix_len - snapshot_backoff;
+            const bounds = if (want_ssm_cp) boundaryWindow(options.ssm_boundaries, ssm_cp_offset, prefix_len) else &[_]usize{};
+            const loop_end = boundaryLoopEnd(prefix_len - snapshot_backoff, ssm_cp_offset, bounds);
             final_start = loop_end;
             // Vision prompts chunk like text (issue #197) — the splice offset
             // below keeps the row scatter chunk-exact. Kill switch restores
@@ -3122,7 +3190,7 @@ pub const Generator = struct {
                 // chunk-locally. Boundary alignment is in ABSOLUTE position
                 // (pos + offset), so the saved snapshot list is correct for
                 // the full prompt, not the truncated tail.
-                const end = nextChunkEnd(pos, loop_end, cur_chunk, want_ssm_cp, ssm_cp_stride, ssm_cp_offset, width_is_adaptive, dense_low_grid);
+                const end = boundaryCutEnd(pos, nextChunkEnd(pos, loop_end, cur_chunk, want_ssm_cp, ssm_cp_stride, ssm_cp_offset, width_is_adaptive, dense_low_grid), ssm_cp_offset, bounds);
                 if (has_vision) ctx.vision_splice_offset = vision_rows_consumed;
                 const chunk_len: c_int = @intCast(end - pos);
                 const chunk_shape = [_]c_int{ 1, chunk_len };
@@ -3269,7 +3337,7 @@ pub const Generator = struct {
                 // are realized; the snapshot is just a refcount-share of the
                 // already-resident state.
                 const abs_end_for_cp2 = end + ssm_cp_offset;
-                if (want_ssm_cp and ssmCapturePos(ssm_cp_stride, abs_end_for_cp2, dense_low_grid)) {
+                if (want_ssm_cp and (ssmCapturePos(ssm_cp_stride, abs_end_for_cp2, dense_low_grid) or isBoundaryPos(bounds, abs_end_for_cp2))) {
                     const cp = try captureSsmCheckpoint(allocator, ctx.ssm_entries.?, abs_end_for_cp2, xfm.s);
                     ssm_checkpoints.append(allocator, cp) catch |e| {
                         var doomed = cp;
@@ -17556,6 +17624,78 @@ test "ssmSnapshotBackoff: engages only under checkpointing and past the backoff 
     // (seq >= 32 turns it into a "prefill" costing ~450ms of eval bubbles):
     // tail = backoff + 1 <= 31.
     try testing.expect(SSM_SNAPSHOT_BACKOFF + 1 < 32);
+}
+
+test "messageBoundaries: every turn-start token after position 0, ascending" {
+    const im = 7;
+    const toks = [_]u32{ im, 1, 2, 3, im, 4, 5, im, 6 };
+    const got = try messageBoundaries(testing.allocator, &toks, im);
+    defer testing.allocator.free(got);
+    try testing.expectEqualSlices(usize, &.{ 4, 7 }, got);
+    const none = try messageBoundaries(testing.allocator, &toks, 99);
+    defer testing.allocator.free(none);
+    try testing.expectEqual(@as(usize, 0), none.len);
+}
+
+test "boundaryWindow: after the restored prefix, through the last prompt token, newest SSM_BOUNDARY_MAX" {
+    const b = [_]usize{ 10, 20, 30, 40 };
+    try testing.expectEqualSlices(usize, &.{ 20, 30, 40 }, boundaryWindow(&b, 10, 100));
+    // The restore point itself is no boundary to cut at; `offset + prefix_len` still is.
+    try testing.expectEqualSlices(usize, &.{ 20, 30 }, boundaryWindow(&b, 10, 20));
+    try testing.expectEqual(@as(usize, 0), boundaryWindow(&b, 40, 5).len);
+    var many: [SSM_BOUNDARY_MAX + 5]usize = undefined;
+    for (&many, 0..) |*p, i| p.* = (i + 1) * 100;
+    const w = boundaryWindow(&many, 0, 1 << 20);
+    try testing.expectEqual(SSM_BOUNDARY_MAX, w.len);
+    try testing.expectEqual(many[many.len - 1], w[w.len - 1]);
+}
+
+test "boundaryCutEnd / boundaryLoopEnd: cut strictly inside, the gen-prompt header replaces the backoff" {
+    const b = [_]usize{ 1000, 1500 };
+    // Relative chunk [0, 4096) at offset 600: the first boundary inside is 1000 -> rel 400.
+    try testing.expectEqual(@as(usize, 400), boundaryCutEnd(0, 4096, 600, &b));
+    try testing.expectEqual(@as(usize, 900), boundaryCutEnd(400, 4096, 600, &b));
+    // A boundary AT the chunk end is no cut (it is captured there anyway).
+    try testing.expectEqual(@as(usize, 400), boundaryCutEnd(0, 400, 600, &b));
+    try testing.expectEqual(@as(usize, 4096), boundaryCutEnd(900, 4096, 600, &b));
+    // Last boundary inside the backoff window moves the loop end up to it; below it, no change.
+    try testing.expectEqual(@as(usize, 900), boundaryLoopEnd(880, 600, &b));
+    try testing.expectEqual(@as(usize, 950), boundaryLoopEnd(950, 600, &b));
+    try testing.expectEqual(@as(usize, 950), boundaryLoopEnd(950, 600, &.{}));
+}
+
+/// The spans the prefill forwards (chunk ends, then the final span's end), mirroring the
+/// chunk loop's end selection in `initWithOptions` for a text prompt.
+fn simulatePrefillSpans(allocator: std.mem.Allocator, all_bounds: []const usize, offset: usize, prompt_len: usize, chunk: usize, stride: usize) ![]usize {
+    var out: std.ArrayList(usize) = .empty;
+    errdefer out.deinit(allocator);
+    const prefix_len = prompt_len - 1;
+    const bounds = boundaryWindow(all_bounds, offset, prefix_len);
+    const loop_end = boundaryLoopEnd(prefix_len - ssmSnapshotBackoff(true, prefix_len, offset > 0), offset, bounds);
+    var pos: usize = 0;
+    while (pos < loop_end) {
+        const end = boundaryCutEnd(pos, nextChunkEnd(pos, loop_end, chunk, true, stride, offset, false, false), offset, bounds);
+        try out.append(allocator, end + offset);
+        pos = end;
+    }
+    try out.append(allocator, prompt_len + offset);
+    return out.toOwnedSlice(allocator);
+}
+
+test "boundary checkpoints: a warm restore at a message start forwards the cold run's spans past it" {
+    // Folded history: system+task (0..900), kept turns, then the summary message at 2400 and
+    // the generation prompt at 2560. The harness dropped an investigation that sat at 2400.
+    const bounds = [_]usize{ 900, 1700, 2400, 2560 };
+    const len: usize = 2566;
+    const cold = try simulatePrefillSpans(testing.allocator, &bounds, 0, len, 4096, 4096);
+    defer testing.allocator.free(cold);
+    // Every boundary is a chunk end (a snapshot), and the gen-prompt header ends the loop.
+    try testing.expectEqualSlices(usize, &.{ 900, 1700, 2400, 2560, 2566 }, cold);
+    // Warm: the old entry (history + investigation) held a checkpoint at 2400; the tail
+    // forwards exactly the cold run's spans from there.
+    const warm = try simulatePrefillSpans(testing.allocator, &bounds, 2400, len - 2400, 4096, 4096);
+    defer testing.allocator.free(warm);
+    try testing.expectEqualSlices(usize, cold[3..], warm);
 }
 
 test "effectiveSsmCheckpointStride: checkpointing never sub-divides the prefill chunk (dense AND MoE)" {

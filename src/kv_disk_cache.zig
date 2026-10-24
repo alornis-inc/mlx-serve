@@ -55,6 +55,7 @@ const model = @import("model.zig");
 const io_util = @import("io_util.zig");
 const disk_writer = @import("kv_disk_writer.zig");
 const log = @import("log.zig");
+const cache_pins = @import("cache_pins.zig");
 
 const KVCache = transformer_mod.KVCache;
 
@@ -429,6 +430,9 @@ fn rawBytes(a: mlx.mlx_array) ?[*]const u8 {
 pub const DiskTier = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
+    /// The RAM tier's context-folding pins (`HotPrefixCache.pins`), borrowed: a pinned
+    /// checkpoint survives `ssmTargetPositions` and a record holding one survives `gcToBudget`.
+    pins: ?*const cache_pins.PinSet = null,
     /// Absolute root for this model's entries (`<base>/<fingerprint>`). Owned.
     root: []u8,
     /// Byte budget across all entries. 0 = unbounded.
@@ -817,6 +821,18 @@ pub const DiskTier = struct {
     /// no checkpoint at or below their usable prefix are skipped. The shared
     /// prefix clamps at `mediaSharedBound(entry.media, media)` exactly as on
     /// the pure-attention side.
+    /// Does a live record of the tier restore EXACTLY the state after `tokens` (a persisted SSM
+    /// checkpoint at `tokens.len` with KV below it)? The pin precondition.
+    pub fn hasCheckpointAt(self: *const DiskTier, tokens: []const u32) bool {
+        const want: u32 = std.math.cast(u32, tokens.len) orelse return false;
+        for (self.entries.items) |*e| {
+            if (e.poisoned or e.tokens.len < tokens.len or e.kv_len < want) continue;
+            if (!std.mem.eql(u32, e.tokens[0..tokens.len], tokens)) continue;
+            if (std.mem.indexOfScalar(u32, e.ssm_positions, want) != null) return true;
+        }
+        return false;
+    }
+
     pub fn bestHybridMatch(
         self: *const DiskTier,
         prompt_ids: []const u32,
@@ -1543,7 +1559,7 @@ pub const DiskTier = struct {
         const old_ssm_pos: []const u32 = if (extend_idx) |i| self.entries.items[i].ssm_positions else &[_]u32{};
         const old_ssm_bytes: []const u64 = if (extend_idx) |i| self.entries.items[i].ssm_bytes else &[_]u64{};
         var written_bytes: u64 = 0;
-        var ssm_res = self.persistSsmCheckpoints(id, dir_rel, kv_target, old_ssm_pos, old_ssm_bytes, ssm_checkpoints, &written_bytes, s, self.max_flush_bytes / 2) catch |err| {
+        var ssm_res = self.persistSsmCheckpoints(tokens, id, dir_rel, kv_target, old_ssm_pos, old_ssm_bytes, ssm_checkpoints, &written_bytes, s, self.max_flush_bytes / 2) catch |err| {
             // errdefer already owns chunk_sizes + ssm_res; a manual deinit here
             // would double-free (the fault-injection test segfaulted on exactly this).
             return err;
@@ -1762,7 +1778,7 @@ pub const DiskTier = struct {
         // Write-ahead bound: the token record, not the flushed kv_len — a
         // checkpoint beyond the current chunks is position-keyed and becomes
         // restorable when a later extend raises kv_len past it.
-        var ssm_res = try self.persistSsmCheckpoints(e.id, dir_rel, @intCast(e.tokens.len), e.ssm_positions, e.ssm_bytes, ssm_checkpoints, &written_bytes, s, self.max_flush_bytes);
+        var ssm_res = try self.persistSsmCheckpoints(e.tokens, e.id, dir_rel, @intCast(e.tokens.len), e.ssm_positions, e.ssm_bytes, ssm_checkpoints, &written_bytes, s, self.max_flush_bytes);
         errdefer ssm_res.deinit(self.allocator);
         const qsa_res = try self.persistQsaHistory(dir_rel, ssm_checkpoints, e.inherited_qsa, e.qsa_history_rows, e.qsa_history_bytes, e.kv_len, s);
 
@@ -2327,7 +2343,7 @@ pub const DiskTier = struct {
     /// span-preservingly. Eligible = a RAM checkpoint at a position within the
     /// KV now on disk (a hybrid restore needs KV covering [0, cp_pos)).
     /// Sorted ascending; caller frees.
-    fn ssmTargetPositions(self: *DiskTier, old_positions: []const u32, cps: []const transformer_mod.SSMCheckpoint, kv_len: u32) ![]u32 {
+    fn ssmTargetPositions(self: *DiskTier, tokens: []const u32, old_positions: []const u32, cps: []const transformer_mod.SSMCheckpoint, kv_len: u32) ![]u32 {
         var set = std.ArrayList(u32).empty;
         errdefer set.deinit(self.allocator);
         try set.appendSlice(self.allocator, old_positions);
@@ -2340,8 +2356,21 @@ pub const DiskTier = struct {
         // Only the span-preserving policies get anchors; the legacy `.oldest`
         // retention (the highest N) is left exactly as it was.
         const anchors = if (self.cp_thin == .oldest) 0 else self.ssm_low_anchors;
+        var pinned: std.ArrayList(bool) = .empty;
+        defer pinned.deinit(self.allocator);
+        if (self.pins) |ps| if (ps.pins.items.len > 0) {
+            try pinned.resize(self.allocator, set.items.len);
+            ps.mask(tokens, set.items, pinned.items);
+        }
         while (set.items.len > self.ssm_max_per_entry) {
-            _ = set.orderedRemove(transformer_mod.positionDropIndexLowAnchored(set.items, self.cp_thin, anchors));
+            if (pinned.items.len == 0) {
+                _ = set.orderedRemove(transformer_mod.positionDropIndexLowAnchored(set.items, self.cp_thin, anchors));
+                continue;
+            }
+            // Pins outrank the per-entry cap: with only pinned positions left the set stays over.
+            const drop = transformer_mod.positionDropIndexPinned(set.items, self.cp_thin, anchors, pinned.items) orelse break;
+            _ = set.orderedRemove(drop);
+            _ = pinned.orderedRemove(drop);
         }
         return set.toOwnedSlice(self.allocator);
     }
@@ -2353,7 +2382,7 @@ pub const DiskTier = struct {
     fn ssmWorkPending(self: *DiskTier, e: *const IndexEntry, cps_opt: ?[]const transformer_mod.SSMCheckpoint, kv_limit: u32) bool {
         const cps = cps_opt orelse return false;
         if (cps.len == 0) return false;
-        const target = self.ssmTargetPositions(e.ssm_positions, cps, kv_limit) catch return false;
+        const target = self.ssmTargetPositions(e.tokens, e.ssm_positions, cps, kv_limit) catch return false;
         defer self.allocator.free(target);
         // A target position missing from disk, OR an on-disk position no
         // longer in target (retention would drop it), is pending work.
@@ -2378,6 +2407,8 @@ pub const DiskTier = struct {
     /// flush extends the entry's kv_len past it.
     fn persistSsmCheckpoints(
         self: *DiskTier,
+        /// The record's tokens: pins are keyed on them.
+        tokens: []const u32,
         id: u64,
         dir_rel: []const u8,
         kv_limit: u32,
@@ -2396,7 +2427,7 @@ pub const DiskTier = struct {
                 .complete = true,
             };
         }
-        const target = try self.ssmTargetPositions(old_positions, cps, kv_limit);
+        const target = try self.ssmTargetPositions(tokens, old_positions, cps, kv_limit);
         defer self.allocator.free(target);
 
         // Delete positions retention drops (present on disk, absent from target).
@@ -2952,17 +2983,23 @@ pub const DiskTier = struct {
     fn gcToBudget(self: *DiskTier) void {
         if (self.max_bytes == 0) return;
         while (self.total_bytes > self.max_bytes and self.entries.items.len > 1) {
-            var lru_idx: usize = 0;
+            var lru_idx: ?usize = null;
             var lru_used: u64 = std.math.maxInt(u64);
             for (self.entries.items, 0..) |*e, i| {
+                // A context-folding branch point: pins outrank the byte budget.
+                if (self.pins) |ps| if (ps.holds(e.tokens)) continue;
                 if (e.last_used < lru_used) {
                     lru_used = e.last_used;
                     lru_idx = i;
                 }
             }
-            const mb = @as(f64, @floatFromInt(self.entries.items[lru_idx].bytes)) / (1024.0 * 1024.0);
+            const victim = lru_idx orelse {
+                log.warn("  [disk-cache] over budget, but every remaining entry holds a pinned branch point\n", .{});
+                break;
+            };
+            const mb = @as(f64, @floatFromInt(self.entries.items[victim].bytes)) / (1024.0 * 1024.0);
             log.info("  [disk-cache] evicted LRU entry (byte budget; {d:.1} MB)\n", .{mb});
-            self.removeAt(lru_idx);
+            self.removeAt(victim);
         }
     }
 
@@ -6923,7 +6960,7 @@ test "DiskTier: SSM retention spacing is priced against the tier, not just cappe
     for (positions[0..93], 0..) |*p, i| p.* = @intCast((i + 1) * 4096);
     positions[93] = 383_039;
 
-    const kept = try tier.ssmTargetPositions(&positions, &[_]transformer_mod.SSMCheckpoint{}, L);
+    const kept = try tier.ssmTargetPositions(&.{}, &positions, &[_]transformer_mod.SSMCheckpoint{}, L);
     defer testing.allocator.free(kept);
 
     try testing.expectEqual(SSM_DISK_MAX_PER_ENTRY, kept.len);
@@ -6944,7 +6981,7 @@ test "DiskTier: SSM retention spacing is priced against the tier, not just cappe
         defer legacy.deinit();
         try testing.expectEqual(transformer_mod.ThinPolicy.oldest, legacy.cp_thin);
         try testing.expectEqual(SSM_DISK_MAX_PER_ENTRY_LEGACY, legacy.ssm_max_per_entry);
-        const old_kept = try legacy.ssmTargetPositions(&positions, &[_]transformer_mod.SSMCheckpoint{}, L);
+        const old_kept = try legacy.ssmTargetPositions(&.{}, &positions, &[_]transformer_mod.SSMCheckpoint{}, L);
         defer testing.allocator.free(old_kept);
         try testing.expectEqual(SSM_DISK_MAX_PER_ENTRY_LEGACY, old_kept.len);
         // End-anchored: the survivors are the last N of the input.
@@ -8019,7 +8056,7 @@ test "DiskTier: the per-entry checkpoint cap is gated; a legacy tier keeps 8" {
     for (&positions, 0..) |*p, i| p.* = @intCast((i + 1) * 4096);
     const L: u32 = 40 * 4096;
 
-    const old_kept = try legacy.ssmTargetPositions(&positions, &[_]transformer_mod.SSMCheckpoint{}, L);
+    const old_kept = try legacy.ssmTargetPositions(&.{}, &positions, &[_]transformer_mod.SSMCheckpoint{}, L);
     defer testing.allocator.free(old_kept);
     try t.expectEqual(SSM_DISK_MAX_PER_ENTRY_LEGACY, old_kept.len);
 
@@ -8027,7 +8064,7 @@ test "DiskTier: the per-entry checkpoint cap is gated; a legacy tier keeps 8" {
     defer gated.deinit();
     gated.cp_thin = .min_span_recency;
     gated.ssm_max_per_entry = SSM_DISK_MAX_PER_ENTRY;
-    const new_kept = try gated.ssmTargetPositions(&positions, &[_]transformer_mod.SSMCheckpoint{}, L);
+    const new_kept = try gated.ssmTargetPositions(&.{}, &positions, &[_]transformer_mod.SSMCheckpoint{}, L);
     defer testing.allocator.free(new_kept);
     try t.expectEqual(SSM_DISK_MAX_PER_ENTRY, new_kept.len);
     try t.expectEqual(@as(usize, 2 * SSM_DISK_MAX_PER_ENTRY_LEGACY), new_kept.len);
@@ -8527,7 +8564,7 @@ test "a persisted 75k entry keeps the dense low grid points 24576 and 32768" {
         66_560, 67_584, 68_608, 69_632, 70_656, 71_680, 72_704, 73_728,
         74_752, 75_302,
     };
-    const kept = try tier.ssmTargetPositions(&generated, &[_]transformer_mod.SSMCheckpoint{}, L);
+    const kept = try tier.ssmTargetPositions(&.{}, &generated, &[_]transformer_mod.SSMCheckpoint{}, L);
     defer testing.allocator.free(kept);
     // Disk red line: never more than the per-entry cap.
     try testing.expectEqual(@as(usize, SSM_DISK_MAX_PER_ENTRY), kept.len);
@@ -8640,7 +8677,7 @@ test "DiskTier: checkpoint thinning never removes the low grid anchors" {
     for (&positions, 0..) |*p, i| p.* = @as(u32, @intCast((i + 1) * GRID));
     const L: u32 = @intCast(N * @as(usize, GRID));
 
-    const kept = try tier.ssmTargetPositions(&positions, &[_]transformer_mod.SSMCheckpoint{}, L);
+    const kept = try tier.ssmTargetPositions(&.{}, &positions, &[_]transformer_mod.SSMCheckpoint{}, L);
     defer testing.allocator.free(kept);
     try testing.expectEqual(SSM_DISK_MAX_PER_ENTRY, kept.len);
     // The anchor pair: 8192 and 16384, the only restore points for a shallow fork.
@@ -8654,7 +8691,7 @@ test "DiskTier: checkpoint thinning never removes the low grid anchors" {
 
     // Repeated thins keep the anchors: the grid floor cannot creep upward turn
     // after turn, which is what emptied e1372's low grid.
-    const round2 = try tier.ssmTargetPositions(kept, &[_]transformer_mod.SSMCheckpoint{}, L);
+    const round2 = try tier.ssmTargetPositions(&.{}, kept, &[_]transformer_mod.SSMCheckpoint{}, L);
     defer testing.allocator.free(round2);
     try testing.expectEqual(@as(u32, GRID), round2[0]);
     try testing.expectEqual(@as(u32, 2 * GRID), round2[1]);
@@ -8681,7 +8718,7 @@ test "DiskTier: checkpoint thinning never removes the low grid anchors" {
     var legacy = try DiskTier.init(testing.allocator, io, base, "fp-lowanchor-legacy", 0, 128);
     defer legacy.deinit();
     try testing.expectEqual(transformer_mod.ThinPolicy.oldest, legacy.cp_thin);
-    const old_kept = try legacy.ssmTargetPositions(&positions, &[_]transformer_mod.SSMCheckpoint{}, L);
+    const old_kept = try legacy.ssmTargetPositions(&.{}, &positions, &[_]transformer_mod.SSMCheckpoint{}, L);
     defer testing.allocator.free(old_kept);
     try testing.expectEqual(SSM_DISK_MAX_PER_ENTRY_LEGACY, old_kept.len);
     try testing.expectEqualSlices(u32, positions[positions.len - SSM_DISK_MAX_PER_ENTRY_LEGACY ..], old_kept);
@@ -8692,7 +8729,7 @@ test "DiskTier: checkpoint thinning never removes the low grid anchors" {
     defer unanchored.deinit();
     unanchored.cp_thin = .min_span_recency;
     unanchored.ssm_max_per_entry = SSM_DISK_MAX_PER_ENTRY;
-    const spread = try unanchored.ssmTargetPositions(&positions, &[_]transformer_mod.SSMCheckpoint{}, L);
+    const spread = try unanchored.ssmTargetPositions(&.{}, &positions, &[_]transformer_mod.SSMCheckpoint{}, L);
     defer testing.allocator.free(spread);
     try testing.expectEqual(@as(usize, SSM_DISK_MAX_PER_ENTRY), spread.len);
     try testing.expectEqual(@as(u32, GRID), spread[0]); // index 0 always survived

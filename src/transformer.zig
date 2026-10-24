@@ -14307,6 +14307,55 @@ pub fn spanPreservingDropIndex(
     return best_at;
 }
 
+/// `spanPreservingDropIndex` that never selects a PINNED index (`pinned[i]`, a context-folding
+/// branch point, `cache_pins.zig`): a pin outranks the cap and the anchors. When the plain pick
+/// is pinned, the unpinned index whose removal widens the coverage gap least goes instead (the
+/// newest only if nothing else is left). Null = every index is pinned: the list stays over cap.
+pub fn spanPreservingDropIndexPinned(
+    comptime T: type,
+    items: []const T,
+    comptime posOf: fn (*const T) usize,
+    policy: ThinPolicy,
+    protect: ?usize,
+    low_anchors: usize,
+    pinned: []const bool,
+) ?usize {
+    std.debug.assert(pinned.len == items.len);
+    const plain = spanPreservingDropIndex(T, items, posOf, policy, protect, low_anchors);
+    if (!pinned[plain]) return plain;
+    const last = items.len - 1;
+    // `.oldest` keeps its own order: the next oldest unpinned goes.
+    if (policy != .oldest) {
+        // The interior the plain scan would consider, minus the pins.
+        var best: ?usize = null;
+        var best_span: usize = std.math.maxInt(usize);
+        var k: usize = @max(low_anchors, 1);
+        while (k < last) : (k += 1) {
+            if (pinned[k]) continue;
+            if (protect) |p| if (k == p) continue;
+            const span = posOf(&items[k + 1]) -| posOf(&items[k - 1]);
+            if (span < best_span) {
+                best_span = span;
+                best = k;
+            }
+        }
+        if (best) |b| return b;
+    }
+    // Then the oldest unpinned below the newest, then the newest itself.
+    for (0..last) |k| if (!pinned[k]) return k;
+    return if (pinned[last]) null else last;
+}
+
+/// `spanPreservingDropIndexPinned` over a checkpoint list.
+pub fn ssmCheckpointDropIndexPinned(cps: []const SSMCheckpoint, policy: ThinPolicy, protect: ?usize, low_anchors: usize, pinned: []const bool) ?usize {
+    return spanPreservingDropIndexPinned(SSMCheckpoint, cps, checkpointPosOf, policy, protect, low_anchors, pinned);
+}
+
+/// `spanPreservingDropIndexPinned` over a bare ascending position list.
+pub fn positionDropIndexPinned(positions: []const u32, policy: ThinPolicy, low_anchors: usize, pinned: []const bool) ?usize {
+    return spanPreservingDropIndexPinned(u32, positions, u32PosOf, policy, null, low_anchors, pinned);
+}
+
 /// `spanPreservingDropIndex` over a bare ascending position list, with the first
 /// `low_anchors` positions protected from thinning.
 pub fn positionDropIndexLowAnchored(positions: []const u32, policy: ThinPolicy, low_anchors: usize) usize {
@@ -75674,4 +75723,26 @@ test "Metal-only kernels decline on a stream without them, so the MLX-op path ru
     const rotated = try rht.transform(a, signs, 1024, false, s);
     defer _ = mlx.mlx_array_free(rotated);
     try mlx.check(mlx.mlx_array_eval(rotated));
+}
+
+test "spanPreservingDropIndexPinned: a pinned branch point outranks the thinning pick" {
+    const t = std.testing;
+    const pos = [_]u32{ 0, 100, 110, 200, 300 };
+    // Unpinned: the plain pick (110, the closest pair) goes.
+    const none = [_]bool{ false, false, false, false, false };
+    try t.expectEqual(@as(?usize, 2), positionDropIndexPinned(&pos, .min_span, 0, &none));
+    // 110 pinned: the next least-widening unpinned index goes instead (100).
+    const p2 = [_]bool{ false, false, true, false, false };
+    try t.expectEqual(@as(?usize, 1), positionDropIndexPinned(&pos, .min_span, 0, &p2));
+    // Everything but the newest pinned: the newest is the last resort.
+    const all_but_last = [_]bool{ true, true, true, true, false };
+    try t.expectEqual(@as(?usize, 4), positionDropIndexPinned(&pos, .min_span, 0, &all_but_last));
+    const all = [_]bool{ true, true, true, true, true };
+    try t.expectEqual(@as(?usize, null), positionDropIndexPinned(&pos, .min_span, 0, &all));
+    // `.oldest` drops index 0; pinned, the next oldest goes.
+    const p0 = [_]bool{ true, false, false, false, false };
+    try t.expectEqual(@as(?usize, 1), positionDropIndexPinned(&pos, .oldest, 0, &p0));
+    // Every interior pinned under a span policy: the oldest unpinned (index 0) goes.
+    const interior = [_]bool{ false, true, true, true, false };
+    try t.expectEqual(@as(?usize, 0), positionDropIndexPinned(&pos, .min_span, 0, &interior));
 }
